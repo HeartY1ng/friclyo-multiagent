@@ -1,8 +1,10 @@
-# frclyo-multiagent
+# friclyo-multiagent
 
 **Prepare your APIs and agent frameworks locally. Pick what each task needs.**
 
 [中文](README.md) · [Changelog](CHANGELOG.en.md) · [Design notes (Chinese)](docs/思路.md) · [Case study (Chinese)](docs/案例/2026-10-13-切词实战.md)
+
+> The project name is **friclyo** (since v0.3.1; formerly frclyo). Internal identifiers such as the code directory `bin/frclyo/`, `FRCLYO_*` environment variables and `frclyo-*` keychain entries keep the frclyo prefix; nothing changes in use.
 
 Build a local pool of models and agents. The coordinator chooses a framework, model, and reasoning level based on the task and how its output can be verified. It defines the contract, dispatches work, and checks results. Workers deliver artifacts; the board shows recorded state.
 
@@ -31,8 +33,8 @@ Install and log in to Codex, or prepare OpenCode and provider credentials. The p
 Clone the repository and enter it:
 
 ```sh
-git clone https://github.com/HeartY1ng/frclyo-multiagent.git
-cd frclyo-multiagent
+git clone https://github.com/HeartY1ng/friclyo-multiagent.git
+cd friclyo-multiagent
 ```
 
 1. Install:

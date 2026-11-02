@@ -4,6 +4,11 @@
 
 Versions follow `major.minor.patch`. During `0.x`, commands and file formats may still change; incompatibilities are listed under "Upgrade notes".
 
+## v0.3.1 (2026-11-02)
+
+- Renamed the project to **friclyo-multiagent** (formerly frclyo-multiagent). The GitHub repository is now `https://github.com/HeartY1ng/friclyo-multiagent`; the old URL redirects. For an existing clone, run `git remote set-url origin https://github.com/HeartY1ng/friclyo-multiagent.git`.
+- Only the public name changed: commands, the code directory `bin/frclyo/`, `FRCLYO_*` environment variables, `frclyo-*` keychain entries and the board's login service keep their names, so no migration is needed.
+
 ## v0.3.0 (2026-11-01)
 
 This release turns dispatching into a full pipeline (batch dispatch → reproduce → merge → verify → release / roll back) and adds about 100 reliability fixes.

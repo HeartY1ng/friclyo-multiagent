@@ -1,8 +1,10 @@
-# frclyo-multiagent
+# friclyo-multiagent
 
 **本地备好 API 和 agent 框架，用的时候按任务自取。**
 
 [English](README.en.md) · [改动记录](CHANGELOG.md) · [设计思路](docs/思路.md) · [切词实战](docs/案例/2026-10-13-切词实战.md)
+
+> 项目名是 **friclyo**（v0.3.1 起；原名 frclyo）。命令、代码目录 `bin/frclyo/`、环境变量 `FRCLYO_*`、钥匙串条目 `frclyo-*` 等内部标识沿用 frclyo 前缀，不影响使用。
 
 在本机准备模型资源池，让大脑按任务类型、难度和验收方式，选择“框架 × 模型 × 档位”。大脑负责定契约、派活和验收，工人负责交付，看板展示有证据的状态。
 
@@ -31,8 +33,8 @@
 克隆仓库后进入目录：
 
 ```sh
-git clone https://github.com/HeartY1ng/frclyo-multiagent.git
-cd frclyo-multiagent
+git clone https://github.com/HeartY1ng/friclyo-multiagent.git
+cd friclyo-multiagent
 ```
 
 1. 安装：

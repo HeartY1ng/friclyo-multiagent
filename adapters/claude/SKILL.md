@@ -1,6 +1,6 @@
 ---
 name: frclyo-brain
-description: 当用户要求 Claude Code“你来当大脑”、使用 frclyo-multiagent 派工、让 Codex 或 OpenCode 执行任务，或运行本框架演示时使用；普通仓库问答不自动启用。
+description: 当用户要求 Claude Code“你来当大脑”、使用 friclyo-multiagent 派工、让 Codex 或 OpenCode 执行任务，或运行本框架演示时使用；普通仓库问答不自动启用。
 ---
 
 开始前完整读取 `{{REPO}}/大脑手册.md` 和 `$FRCLYO_HOME/配置/偏好.md`（未设根目录时为 `~/AgentWork/配置/偏好.md`），按手册执行；缺文件报告需要输入，不把模板示例当授权。

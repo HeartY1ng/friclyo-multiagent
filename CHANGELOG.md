@@ -4,6 +4,11 @@
 
 版本号按 `主版本.次版本.修订号` 递增。`0.x` 阶段命令和文件格式仍可能调整，有不兼容的地方会写在"升级注意"里。
 
+## v0.3.1（2026-11-02）
+
+- 项目改名为 **friclyo-multiagent**（原名 frclyo-multiagent）。GitHub 仓库地址改成 `https://github.com/HeartY1ng/friclyo-multiagent`，旧地址会自动跳转；已经克隆的仓库可以运行 `git remote set-url origin https://github.com/HeartY1ng/friclyo-multiagent.git`。
+- 只改了对外名字：命令、代码目录 `bin/frclyo/`、环境变量 `FRCLYO_*`、钥匙串条目 `frclyo-*`、看板自启服务名等内部标识都不变，不需要迁移。
+
 ## v0.3.0（2026-11-01）
 
 这一版的重点：从"能派活"变成一条完整的流水线（批量派活 → 复现 → 合并 → 验收 → 发布 / 回滚），再加上大约 100 处可靠性修复。
