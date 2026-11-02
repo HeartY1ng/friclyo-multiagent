@@ -93,6 +93,11 @@
          background: var(--run-bg); padding: 2px 9px; border-radius: 999px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .who.idle { color: var(--muted); background: var(--gray-bg); }
   .proj { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .project-tag { display: inline-block; font-size: 12px; font-weight: 700; padding: 1px 7px;
+    border: 1px solid currentColor; border-radius: 6px; color: var(--project-light); overflow-wrap: anywhere; }
+  .project-group { grid-column: 1 / -1; min-width: 0; }
+  .project-group h3 { margin: 4px 0 10px; font-size: 14px; overflow-wrap: anywhere; }
+  @media (prefers-color-scheme: dark) { .project-tag { color: var(--project-dark); } }
   .run .title { font-weight: 600; margin: 8px 0 10px; line-height: 1.4; }
   .prog { height: 5px; border-radius: 5px; background: var(--line); overflow: hidden; }
   .prog i { display: block; height: 100%; background: var(--run); transition: width 1s linear; }
@@ -104,7 +109,7 @@
 
   /* ========== ③ 最近完成 ========== */
   .list { overflow: hidden; }
-  .row { display: grid; grid-template-columns: 74px 1fr 84px 110px 86px; gap: 12px; align-items: center; padding: 11px 16px;
+  .row { display: grid; grid-template-columns: 112px 1fr 84px 110px 86px; gap: 12px; align-items: center; padding: 11px 16px;
          border-top: 1px solid var(--line); cursor: pointer; }
   .row:first-child { border-top: 0; }
   .row:hover { background: var(--surface-2); }
@@ -119,6 +124,27 @@
   .badge.wait { background: var(--amber-bg); color: var(--amber); }
   .badge.run { background: var(--done-bg); color: var(--done); }
   .more { padding: 10px 16px; border-top: 1px solid var(--line); font-size: 13px; }
+
+  /* ========== 版本与派活 ========== */
+  .release-dispatch { min-width: 0; overflow-wrap: anywhere; }
+  .release-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.5fr); gap: 12px; }
+  .release-card { padding: 14px 16px; min-width: 0; }
+  .release-card h3 { margin: 0 0 8px; font-size: 14px; }
+  .release-current { font: 600 23px/1.4 ui-monospace, "SF Mono", Menlo, monospace; color: var(--done); }
+  .release-note { color: var(--muted); font-size: 12px; margin: 8px 0; }
+  .release-versions { margin-top: 12px; }
+  .release-dispatch summary { cursor: pointer; }
+  .release-version { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; padding: 7px 8px; border-top: 1px solid var(--line); font-size: 12px; }
+  .release-version.current { background: var(--done-bg); border-radius: 8px; }
+  .release-version code { font-weight: 600; }
+  .dispatch-batch { border-top: 1px solid var(--line); padding: 10px 0; }
+  .dispatch-batch:first-of-type { border-top: 0; }
+  .dispatch-title { font-weight: 600; }
+  .dispatch-counts { display: flex; flex-wrap: wrap; gap: 4px 12px; margin: 5px 0; font-size: 12px; font-variant-numeric: tabular-nums; }
+  .dispatch-task { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 12px; padding: 8px 0; border-top: 1px dashed var(--line); font-size: 12px; }
+  .dispatch-task > * { min-width: 0; }
+  .dispatch-task .task-metrics { grid-column: 1 / -1; color: var(--muted); }
+  @media (max-width: 720px) { .release-grid { grid-template-columns: minmax(0, 1fr); } }
 
   /* ========== 详情抽屉 ========== */
   .shade { position: fixed; inset: 0; background: rgba(0,0,0,.25); opacity: 0; pointer-events: none; transition: opacity .2s; }
@@ -168,13 +194,13 @@
   /* ========== 窄屏 ========== */
   @media (max-width: 720px) {
     .wrap { padding: 16px 16px 48px; }
-    .row { grid-template-columns: 62px 1fr auto; }
+    .row { grid-template-columns: 112px 1fr auto; }
     .row .num.t, .row .num.c { display: none; }
     .grid { grid-template-columns: 1fr; }
     .item { grid-template-columns: 4px 1fr; }
     .item .acts { grid-column: 2; margin-top: 8px; }
   }
-  /* 放弃属于已结束任务，用现有灰色调弱化结论，避免看成失败。 */
+  /* 放弃、未登记、测试都属于已结束的中性状态，用同一灰色调弱化结论，不看成失败。 */
   .badge.gray { color: var(--muted); background: var(--bg); }
 </style>
 </head>
@@ -209,6 +235,10 @@
     <h2>最近完成 <span class="n" id="rec-n">0</span><span class="muted" style="font-weight:400;font-size:12px">最近 14 天</span></h2>
     <div id="recent" class="card list"></div>
   </section>
+  <section class="release-dispatch" aria-labelledby="release-dispatch-heading">
+    <h2 id="release-dispatch-heading">版本与派活 <span class="muted" style="font-weight:400;font-size:12px">全部项目</span></h2>
+    <div id="release-dispatch" class="release-grid"></div>
+  </section>
 </div>
 
 <!-- 详情抽屉 -->
@@ -242,6 +272,7 @@ let dismissed = loadDismissed();
 
 // 时间显示：多久以前、持续多久、几点
 function ago(t) {
+  t = finiteNumber(t);
   if (!t) return '';
   const d = Math.max(0, nowS() - t);
   if (d < 45) return '刚刚';
@@ -250,6 +281,7 @@ function ago(t) {
   return Math.round(d / 86400) + ' 天前';
 }
 function dur(s) {
+  s = finiteNumber(s);
   if (s == null) return '—';
   s = Math.max(0, Math.round(s));
   if (s < 60) return s + ' 秒';
@@ -257,13 +289,13 @@ function dur(s) {
   return Math.floor(s / 3600) + ' 小时 ' + Math.floor((s % 3600) / 60) + ' 分';
 }
 function clock(s) {   // 12:05 这种计时器格式
-  s = Math.max(0, Math.round(s || 0));
+  s = Math.max(0, Math.round(finiteNumber(s, 0)));
   const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), x = s % 60;
   return (h ? h + ':' + String(m).padStart(2, '0') : m) + ':' + String(x).padStart(2, '0');
 }
-function hm(t) { if (!t) return ''; const d = new Date(t * 1000); return (d.getMonth() + 1) + '月' + d.getDate() + '日 ' + String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0'); }
-function tm(t) { if (!t) return ''; const d = new Date(t * 1000); return [d.getHours(), d.getMinutes(), d.getSeconds()].map(x => String(x).padStart(2, '0')).join(':'); }
-function ktok(n) { if (!n) return '—'; return n >= 1000 ? (n / 1000).toFixed(n >= 100000 ? 0 : 1) + 'k' : String(n); }
+function hm(t) { t = finiteNumber(t); if (!t) return ''; const d = new Date(t * 1000); return (d.getMonth() + 1) + '月' + d.getDate() + '日 ' + String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0'); }
+function tm(t) { t = finiteNumber(t); if (!t) return ''; const d = new Date(t * 1000); return [d.getHours(), d.getMinutes(), d.getSeconds()].map(x => String(x).padStart(2, '0')).join(':'); }
+function ktok(n) { n = finiteNumber(n); if (!n) return '—'; return n >= 1000 ? (n / 1000).toFixed(n >= 100000 ? 0 : 1) + 'k' : String(n); }
 const WORKER = { codex: 'Codex', opencode: 'OpenCode', qunxian: '群贤', claude: 'Claude' };
 function who(w, m, e) {
   const parts = [WORKER[w] || w || '?'];
@@ -295,17 +327,25 @@ window.addEventListener('unhandledrejection', (ev) => report('未处理的异步
 function put(id, html) { if (S.html[id] !== html) { $(id).innerHTML = html; S.html[id] = html; } }
 
 // ================= 2. 拉数据（每 3 秒；页面在后台时每 15 秒） =================
-async function poll() {
+let stateRequest = 0;
+async function refreshState() {
+  const request = ++stateRequest, project = S.project;
+  const current = () => request === stateRequest && project === S.project;
   try {
-    const res = await getJSON('/api/state?project=' + encodeURIComponent(S.project));
+    const res = await getJSON('/api/state?project=' + encodeURIComponent(project));
+    if (!current()) return;
     if (!res.ok) throw new Error('HTTP ' + res.status);
     S.data = res.d;
     S.lastOk = Date.now(); S.failing = false;
     render();
   } catch (e) {
+    if (!current()) return;
     S.failing = true;
   }
   renderLive();
+}
+async function poll() {
+  await refreshState();
   setTimeout(poll, document.hidden ? 15000 : 3000);
 }
 document.addEventListener('visibilitychange', () => { if (!document.hidden) { renderLive(); } });
@@ -315,6 +355,7 @@ function render() {
   const d = S.data; if (!d) return;
   renderProjects(d); renderHealth(d.健康 || {}); renderAttention(d.要你处理 || []);
   renderRunning(d.正在干活 || []); renderRecent(d.最近完成 || []);
+  renderReleaseDispatch(d.版本与派活 || {});
   tick();
 }
 
@@ -349,17 +390,26 @@ function renderHealth(h) {
   const chips = [];
   // Codex 额度由 app-server 每分钟查询，失败时颜色提醒但不清空上次值。
   const q = h.codex;
-  if (q && q.已用 != null) {
-    const lv = q.已用 >= 90 ? 'bad' : q.错误 || q.已用 >= 70 ? 'warn' : 'ok';
-    chips.push('<div class="chip ' + lv + '"><i class="dot"></i><b>Codex 额度</b>' +
-      '<div class="meter"><i style="width:' + Math.min(100, q.已用) + '%"></i></div>已用 ' + esc(q.已用) + '%' + healthAge(q) +
-      (q.重置 ? '<span>· ' + esc(hm(q.重置)) + ' 重置</span>' : '') + healthError(q) + '</div>');
+  const windows = q && (q.窗口 || (q.已用 != null ? [q] : []));
+  if (windows && windows.length) {
+    for (const w of windows) {
+      const lv = w.已用 >= 90 ? 'bad' : q.错误 || w.已用 >= 70 ? 'warn' : 'ok';
+      chips.push('<div class="chip ' + lv + '"><i class="dot"></i><b>Codex ' + esc(w.名字 || '额度（窗口未知）') + '</b>' +
+        '<div class="meter"><i style="width:' + Math.min(100, w.已用) + '%"></i></div>已用 ' + esc(w.已用) + '%' + healthAge(q) +
+        (w.重置 ? '<span>· ' + esc(hm(w.重置)) + ' 重置</span>' : '') + healthError(q) + '</div>');
+    }
   } else {
     chips.push('<div class="chip unk"><i class="dot"></i><b>Codex 额度</b><span>暂无数据</span>' + healthAge(q) + healthError(q) + '</div>');
   }
   // 余额同时显示更新时间与错误；币种来自官方响应，避免把美元标成人民币。
   for (const b of (h.余额 || [])) {
-    if (b.余额 != null) {
+    if (Array.isArray(b.额度) && b.额度.length) {
+      const details = b.额度.map(w => '<span>' + esc(w.名字) + '：已用 ' +
+        esc(w.已用) + esc(w.单位) + ' / ' + esc(w.限额) + esc(w.单位) + '，' +
+        (w.重置 ? esc(new Date(w.重置 * 1000).toLocaleString()) + ' 重置' : '重置时间未提供') + '</span>').join('');
+      chips.push('<div class="chip ' + (b.错误 ? 'warn' : 'ok') + '"><i class="dot"></i><b>' +
+        esc(b.名字) + '</b>' + details + healthAge(b) + healthError(b) + '</div>');
+    } else if (b.余额 != null) {
       const lv = b.错误 || b.余额 < 10 ? 'warn' : 'ok';
       const currency = b.币种 === 'CNY' ? '¥' : b.币种 === 'USD' ? '$' : (b.币种 || '') + ' ';
       chips.push('<div class="chip ' + lv + '"><i class="dot"></i><b>' + esc(b.名字) + '</b>' + esc(currency) + Number(b.余额).toFixed(2) + healthAge(b) + healthError(b) + '</div>');
@@ -383,6 +433,31 @@ function renderHealth(h) {
   put('health', chips.join(''));
 }
 
+// 固定色板与名称哈希：刷新、筛选及三个区域都使用同一项目色。
+const PROJECT_COLORS = [
+  ['#2459a6', '#8ab4ff'], ['#7a3995', '#d6a0ef'], ['#167060', '#6dd8bd'],
+  ['#945116', '#efb978'], ['#a33463', '#ff9bc1'], ['#526719', '#bfd779']
+];
+// 轮次文件的数字必须是有限 JSON 数字；不把字符串、布尔值或对象隐式转成数字。
+function finiteNumber(value, fallback = null) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+function roundNumbers(row) {
+  const out = { ...row };
+  for (const key of ['开始', '结束', '超时秒', '步数', '轮数', 'tokens', '费用', '用时秒', '时间线总数', '退出码']) {
+    out[key] = finiteNumber(row[key]);
+  }
+  if (!(out.超时秒 > 0)) out.超时秒 = null;
+  return out;
+}
+function projectTag(name) {
+  if (!name) return '';
+  let hash = 0;
+  for (const ch of name) hash = (Math.imul(hash, 31) + ch.codePointAt(0)) >>> 0;
+  const colors = PROJECT_COLORS[hash % PROJECT_COLORS.length];
+  return '<span class="project-tag" style="--project-light:' + colors[0] + ';--project-dark:' + colors[1] + '">' + esc(name) + '</span>';
+}
+
 function renderAttention(list) {
   const shown = list.filter(x => !dismissed[x.键]);
   const hidden = list.length - shown.length;
@@ -394,7 +469,7 @@ function renderAttention(list) {
     html = shown.map(x => {
       const lvName = { red: '要紧', amber: '要处理', gray: '有空看看' }[x.级别] || '';
       return '<div class="card item ' + esc(x.级别) + '"><div class="bar"></div><div>' +
-        '<div class="what">' + esc(x.事情) + (x.标题 ? '<small>' + esc(x.标题) + (x.任务 ? ' · ' + esc(x.任务) : '') + '</small>' : '') + '</div>' +
+        '<div class="what">' + projectTag(x.项目) + ' ' + esc(x.事情) + (x.标题 ? '<small>' + esc(x.标题) + (x.任务 ? ' · ' + esc(x.任务) : '') + '</small>' : '') + '</div>' +
         (x.细节 ? '<div class="detail">' + esc(x.细节) + '</div>' : '') +
         '<div class="todo">' + esc(lvName) + ' · <b>怎么办：</b>' + esc(x.怎么办 || '') + '</div></div>' +
         '<div class="acts">' + (x.任务 ? '<button class="btn" data-open="' + esc(x.任务) + '" data-round="' + esc(x.轮次 || '') + '" data-tab="' + (x.键 && x.键.startsWith('input') ? 'result' : 'progress') + '">查看</button>' : '') +
@@ -405,35 +480,116 @@ function renderAttention(list) {
   put('attn', html);
 }
 
+// 展开状态独立保存，自动刷新后仍留在用户打开的批次。
+const panelExpanded = new Set();
+function panelTime(t, approximate) {
+  t = finiteNumber(t);
+  return t == null ? '时间未知' : (approximate ? '约 ' : '') + new Date(t * 1000).toLocaleString();
+}
+function panelTokens(n) { n = finiteNumber(n); return n == null ? '未知' : n.toLocaleString(); }
+function panelQuota(q) { return q && finiteNumber(q.已用) != null ? q.已用 + '%' : '未知'; }
+function panelStatus(s) {
+  const cls = s === '完成' ? 'ok' : s === '失败' ? 'bad' : s === '在跑' ? 'run' : 'gray';
+  return '<span class="badge ' + cls + '">' + esc(s) + '</span>';
+}
+function publicationTime(v) { return v.时间 == null ? '未知（旧记录）' : panelTime(v.时间, false); }
+function versionHealth(v) {
+  const notes = [];
+  if (v.完整 === false) notes.push('残缺');
+  if (v.可回滚 === false) notes.push('不能回滚');
+  if (v.清理中) notes.push('清理中');
+  if (v.完整 == null || v.可回滚 == null) notes.push('完整性／回滚状态未知');
+  if (v.可回滚 === true) notes.push('可回滚');
+  return '<span class="' + (v.可回滚 === false ? 'badge bad' : 'muted') + '">' + esc(notes.join(' · ')) + '</span>' +
+    (v.原因 ? '<span>' + esc(v.原因) + '</span>' : '');
+}
+function versionWorkers(title, workers) {
+  return '<h3>' + esc(title) + '</h3>' + (workers == null ? '<div class="muted">未知</div>' :
+    workers.length ? workers.map(w => '<div class="release-version"><span>' + esc(w.工人 || '工人未知') +
+      ' · ' + esc(w.任务 || '任务未知') + ' · ' + esc(w.轮 || '轮次未知') + '</span><span>PID ' + esc(w.PID == null ? '未知' : w.PID) +
+      '</span><code>' + esc(w.提交 || '版本未知') + '</code></div>').join('') : '<div class="muted">暂无匹配的登记记录</div>');
+}
+function renderReleaseDispatch(data) {
+  const r = data.发布 || {}, dispatch = data.派活 || {}, current = r.当前版本;
+  let left = '<div class="card release-card"><h3>当前版本</h3>';
+  left += current ? '<div class="release-current">' + esc(current.提交) + '</div>' +
+    '<div>' + esc(current.验收方式) + ' · ' + esc(current.验收通过 === true ? '验收通过' : current.验收通过 === false ? '未通过验收' : '验收未知') + '</div>' +
+    '<div class="release-note">发布时间：' + esc(publicationTime(current)) + '</div>' + versionHealth(current) : '<div class="muted">稳定入口版本未知</div>';
+  left += '<div>上一个版本：<code>' + esc(r.上一个版本 || '未知') + '</code></div>' +
+    '<div class="release-note">' +
+    ((r.旧版本锁记录 || []).length ? '旧版本锁记录：' + esc(r.旧版本锁记录.join('、')) + '（共 ' + esc(r.旧版本锁记录数) + ' 个）' : '未见旧版本锁记录') +
+    (r.锁说明 ? '<br>' + esc(r.锁说明) : '') + '</div>';
+  if (r.提示) left += '<div class="release-note">' + esc(r.提示) + '</div>';
+  left += versionWorkers('还在用旧版本的工人', r.旧版本工人) + versionWorkers('无法确认', r.无法确认工人) +
+    '<div class="release-note">' + esc(r.使用记录提示 || '') + ' ' + esc(r.使用记录说明 || '') + '</div>';
+  if (r.版本检查提示) left += '<div class="release-note">版本检查：' + esc(r.版本检查提示) + '</div>';
+  left += '<details class="release-versions" data-panel-detail="versions"' + (panelExpanded.has('versions') ? ' open' : '') + '><summary>版本列表 · 最近 ' + (r.版本列表 || []).length + ' 个</summary>' +
+    ((r.版本列表 || []).map(v => '<div class="release-version' + (v.当前 ? ' current' : '') + '"><code>' + esc(v.提交) + '</code>' +
+      (v.当前 ? '<span class="badge run">当前</span>' : '') + '<span>' + esc(v.验收通过 === true ? '通过' : v.验收通过 === false ? '未通过' : '验收未知') + '</span><span>' +
+      esc(v.验收方式) + '</span><span class="muted">发布时间：' + esc(publicationTime(v)) + '</span>' + versionHealth(v) + '</div>').join('') || '<div class="release-note">暂无版本记录</div>') + '</details></div>';
+  let right = '<div class="card release-card"><h3>派活批次 · 最近 5 批</h3><div class="release-note">随看板自动刷新 · 前台每 3 秒</div>';
+  for (const b of (dispatch.批次 || [])) {
+    const n = b.计数 || {}, active = finiteNumber(n.在跑, 0), key = 'batch:' + b.批次;
+    right += '<details class="dispatch-batch" data-panel-detail="' + esc(key) + '"' + (panelExpanded.has(key) ? ' open' : '') + '><summary><span class="dispatch-title">' + esc(b.批次) + '</span>' +
+      (active > 0 ? ' <span class="badge run">在跑 ' + esc(active) + '</span>' : '') +
+      '<div class="release-note">开始：' + esc(panelTime(b.开始, false)) + '<br>结束：' +
+      (b.有结束记录 ? esc(panelTime(b.结束, false)) + ' · ' + esc(b.结束状态 || '结束状态未知') : b.有批次信息 ? '没有结束记录' : '未知（旧批次或记录不可读）') + '</div><div class="dispatch-counts">' +
+      '<span>总数：' + (b.总数 == null ? '未知（已记录 ' + esc(b.已记录总数) + '）' : esc(b.总数)) + '</span>' +
+      '<span>完成 ' + esc(n.完成 || 0) + '</span><span>失败 ' + esc(n.失败 || 0) + '</span><span>跳过 ' + esc(n.跳过 || 0) + '</span>' +
+      '<span>在跑 ' + (b.在跑完整 ? esc(active) : active ? '至少 ' + esc(active) : '未知') + '</span>' + (n.未知 ? '<span>等待结果／未知 ' + esc(n.未知) + '</span>' : '') + '</div>' +
+      '<div class="dispatch-counts"><span>token 合计 ' + esc(panelTokens(b.tokens)) + (b.用量缺失 ? '（' + esc(b.用量缺失) + ' 项用量未知）' : '') + '</span>' +
+      '<span>周额度已用 ' + esc(panelQuota(b.额度前)) + ' → ' + esc(panelQuota(b.额度后)) + '</span></div>' +
+      (b.额度前 && b.额度后 && b.额度前.重置 !== b.额度后.重置 ? '<div class="release-note">额度跨重置窗口，不能直接相减</div>' : '') +
+      (b.坏行 || b.截断 || b.提示 ? '<div class="release-note">' + (b.坏行 ? '跳过 ' + esc(b.坏行) + ' 条坏行／重复记录。' : '') + (b.截断 ? '读取已达上限，以上为部分统计。' : '') + esc(b.提示 || '') + '</div>' : '') + '</summary>' +
+      '<div>' + ((b.任务 || []).map(t => '<div class="dispatch-task"><div>' + esc(t.任务) + ' · ' + esc(t.轮) + '</div>' + panelStatus(t.状态) +
+        '<div class="task-metrics">' + esc(who(t.工人, t.模型, '')) + ' · ' + esc(dur(t.用时秒)) + ' · ' + esc(panelTokens(t.tokens)) + ' tokens</div></div>').join('') || '<div class="release-note">尚无任务结果</div>') + '</div></details>';
+  }
+  if (!(dispatch.批次 || []).length) right += '<div class="muted">暂无派活批次</div>';
+  right += '<div class="release-note">' + esc(dispatch.说明 || '') + (dispatch.提示 ? '<br>' + esc(dispatch.提示) : '') + '</div></div>';
+  const html = left + right;
+  put('release-dispatch', html);
+}
+
 function renderRunning(list) {
   $('run-n').textContent = list.length;
   if (!list.length) { put('running', '<div class="card calm" style="grid-column:1/-1"><i class="dot" style="color:var(--faint)"></i>现在没有工人在干活</div>'); return; }
-  put('running', list.map(x => {
+  const card = row => {
+    const x = roundNumbers(row);
     const claimed = x.种类 === 'claimed';
     return '<div class="card run" data-open="' + esc(x.任务) + '" data-round="' + esc(x.轮次 || '') + '" data-tab="progress">' +
       '<div class="head"><span class="who' + (claimed ? ' idle' : '') + '"><i class="dot' + (claimed ? '' : ' pulse') + '"></i>' + esc(who(x.工人, x.模型, x.档位)) + '</span>' +
-      '<span class="proj">' + esc(x.项目) + ' · ' + esc(x.任务) + (x.轮次 ? ' ' + esc(x.轮次) : '') + '</span></div>' +
+      projectTag(x.项目) + '<span class="proj">' + esc(x.任务) + (x.轮次 ? ' ' + esc(x.轮次) : '') + '</span></div>' +
       '<div class="title">' + esc(x.标题) + '</div>' +
-      (x.超时秒 ? '<div class="prog" data-start="' + x.开始 + '" data-timeout="' + x.超时秒 + '"><i style="width:0"></i></div>' : '') +
-      '<div class="times"><span>已干 <b data-since="' + (x.开始 || '') + '">' + clock(nowS() - (x.开始 || nowS())) + '</b></span>' +
-      '<span>' + (x.超时秒 ? '上限 ' + clock(x.超时秒) : '') + (x.步数 ? ' · 第 ' + x.步数 + ' 步' : '') + '</span></div>' +
+      (x.超时秒 ? '<div class="prog" data-start="' + esc(x.开始) + '" data-timeout="' + esc(x.超时秒) + '"><i style="width:0"></i></div>' : '') +
+      '<div class="times"><span>已干 <b data-since="' + esc(x.开始 || '') + '">' + esc(clock(nowS() - (x.开始 || nowS()))) + '</b></span>' +
+      '<span>' + (x.超时秒 ? '上限 ' + esc(clock(x.超时秒)) : '') + (x.步数 ? ' · 第 ' + esc(x.步数) + ' 步' : '') + '</span></div>' +
       '<div class="step"><b>最近：</b>' + esc(x.最近一步) + '</div></div>';
-  }).join(''));
+  };
+  const groups = new Map();
+  for (const x of list) {
+    if (!groups.has(x.项目)) groups.set(x.项目, []);
+    groups.get(x.项目).push(x);
+  }
+  put('running', groups.size < 2 ? list.map(card).join('') :
+    Array.from(groups, ([project, items]) => '<div class="project-group"><h3>' +
+      projectTag(project) + ' · 负责对话：' + esc(items[0].负责对话 || '未登记') +
+      '</h3><div class="grid">' + items.map(card).join('') + '</div></div>').join(''));
 }
 
 function renderRecent(list) {
   $('rec-n').textContent = list.length;
   if (!list.length) { put('recent', '<div class="calm">最近 14 天没有做完的活</div>'); return; }
   const N = 12, items = S.showAllRecent ? list : list.slice(0, N);
-  let html = items.map(x => {
+  let html = items.map(row => {
+    const x = roundNumbers(row);
     const cost = x.费用 != null ? '$' + (x.费用 < 0.01 ? x.费用.toFixed(4) : x.费用.toFixed(2)) : (x.订阅 ? '订阅额度' : '');
     return '<div class="row" data-open="' + esc(x.任务) + '" data-round="' + esc(x.轮次 || '') + '" data-tab="result">' +
       '<span class="badge ' + esc(x.结论级别) + '">' + esc(x.结论) + '</span>' +
       '<div style="min-width:0"><div class="title" title="' + esc(x.标题) + '">' + esc(x.标题) + '</div>' +
-      '<div class="sub">' + esc(who(x.工人, x.模型, x.档位)) + (x.轮数 > 1 ? ' · ' + x.轮数 + ' 轮' : '') + ' · ' + esc(x.项目) + ' · ' + esc(x.任务) + '</div></div>' +
-      '<div class="num t">' + dur(x.用时秒) + '</div>' +
-      '<div class="num c">' + ktok(x.tokens) + ' tokens' + (cost ? '<br><span>' + esc(cost) + '</span>' : '') + '</div>' +
-      '<div class="when" data-ago="' + (x.结束 || '') + '">' + ago(x.结束) + '</div></div>';
+      '<div class="sub">' + esc(who(x.工人, x.模型, x.档位)) + (x.轮数 > 1 ? ' · ' + esc(x.轮数) + ' 轮' : '') + ' · ' + projectTag(x.项目) + ' · ' + esc(x.任务) + '</div></div>' +
+      '<div class="num t">' + esc(dur(x.用时秒)) + '</div>' +
+      '<div class="num c">' + esc(ktok(x.tokens)) + ' tokens' + (cost ? '<br><span>' + esc(cost) + '</span>' : '') + '</div>' +
+      '<div class="when" data-ago="' + esc(x.结束 || '') + '">' + esc(ago(x.结束)) + '</div></div>';
   }).join('');
   if (list.length > N) html += '<div class="more"><button class="linkbtn" data-morerecent="1">' + (S.showAllRecent ? '收起' : '显示更早的 ' + (list.length - N) + ' 件') + '</button></div>';
   put('recent', html);
@@ -458,6 +614,8 @@ const TABS = [['progress', '进展'], ['result', '交付说明'], ['card', '任�
 const STATE_TEXT = { running: '进行中', done: '执行完成', timeout: '超时', failed: '失败', interrupted: '中断' };
 const ICON = { start: '▶', tool: '⚙', out: '✓', warn: '✗', say: '💬', think: '·', edit: '✎', end: '■', error: '⚠' };
 let drawerTimer = null;
+let fileRequest = 0;
+let detailRequest = 0;
 
 function openTask(id, round, tab) {
   S.open = { id, round: round || '', tab: tab || 'progress' };
@@ -474,32 +632,36 @@ function closeTask() {
 async function loadDetail() {
   clearTimeout(drawerTimer);
   if (!S.open) return;
-  const id = S.open.id;
+  const opened = S.open, id = opened.id, round = opened.round;
+  const request = ++detailRequest;
+  const current = () => request === detailRequest && S.open === opened && S.open.round === round;
   let failed = false;
   try {
-    const res = await getJSON('/api/task?id=' + encodeURIComponent(id));
-    if (!S.open || S.open.id !== id) return;          // 等结果的时候已经换了别的任务
-    if (!res.ok) { $('dh').innerHTML = '<button class="x" data-close="1">×</button><h3>' + esc((res.d && res.d.错误) || '读取失败（HTTP ' + res.status + '）') + '</h3>'; S.html.dh = null; return; }
+    const res = await getJSON('/api/task?id=' + encodeURIComponent(id) + '&round=' + encodeURIComponent(round));
+    if (!current()) return; // 切轮、重开同一任务及乱序响应都不能覆盖当前选择。
+    if (!res.ok) throw new Error((res.d && res.d.错误) || 'HTTP ' + res.status);
     S.detail = res.d;
-    if (!S.open.round || !S.detail.轮次.some(x => x.轮次 === S.open.round)) S.open.round = S.detail.轮次.length ? S.detail.轮次[S.detail.轮次.length - 1].轮次 : '';
+    S.open.round = S.detail.当前轮次 || '';
+    writeHash();
     renderDrawer();
   } catch (e) {
+    if (!current()) return;
     failed = true;
     report('打开任务 ' + id, e);
-    if (!S.open || S.open.id !== id) return;
     // 第一次就失败：把"加载中"换成原因；已经显示过内容的，就在正文顶上提示，不清掉内容
-    const msg = '读取失败：' + esc(e.message || String(e)) + '。5 秒后自动重试。';
+    const msg = '刷新失败，稍后重试：' + esc(e.message || String(e)) + '。5 秒后自动重试。';
     if (!S.detail || S.detail.任务 !== id) { $('dh').innerHTML = '<button class="x" data-close="1">×</button><h3>' + msg + '</h3>'; S.html.dh = null; }
     else { $('db').insertAdjacentHTML('afterbegin', '<div class="box amber">' + msg + '</div>'); S.html.db = null; }
   }
-  if (!S.open || S.open.id !== id) return;
+  if (request !== detailRequest || S.open !== opened) return;
   const cur = S.detail && S.detail.任务 === id && S.detail.轮次.find(x => x.轮次 === S.open.round);
   drawerTimer = setTimeout(loadDetail, failed ? 5000 : (cur && cur.状态 === 'running' ? 2000 : 15000));
 }
 
 function renderDrawer() {
   const d = S.detail, o = S.open; if (!d || !o) return;
-  const r = d.轮次.find(x => x.轮次 === o.round) || null;
+  const rawRound = d.轮次.find(x => x.轮次 === o.round);
+  const r = rawRound && Array.isArray(rawRound.时间线) ? roundNumbers(rawRound) : null;
   // 头部：标题、任务号、项目、结论、轮次切换、关键数字
   let h = '<button class="x" data-close="1" aria-label="关闭">×</button><h3>' + esc(d.标题) + '</h3>' +
     '<div class="meta"><span class="badge ' + esc(d.结论级别) + '">' + esc(d.结论) + '</span><span>' + esc(d.任务) + '</span><span>' + esc(d.项目) + '</span>' +
@@ -513,14 +675,16 @@ function renderDrawer() {
   }
   if (r) {
     const secs = (r.结束 || nowS()) - (r.开始 || nowS());
-    const tok = r.用量 ? ktok(r.用量.输入) + ' 入 / ' + ktok(r.用量.输出) + ' 出' : '—';
+    const tok = r.用量 ? ktok(r.用量.输入) + ' 入 / ' + ktok(r.用量.输出) + ' 出' +
+      (r.用量.缓存读取 != null ? ' / 缓存读取 ' + ktok(r.用量.缓存读取) : '') +
+      (r.用量.缓存写入 != null ? ' / 缓存写入 ' + ktok(r.用量.缓存写入) : '') : '—';
     h += '<div class="facts">' +
       '<div><span>谁做的</span>' + esc(who(r.工人, r.模型, r.档位)) + '</div>' +
       '<div><span>开始</span>' + esc(hm(r.开始)) + '</div>' +
-      '<div><span>用时</span>' + (r.状态 === 'running' ? '<b data-since="' + r.开始 + '">' + clock(secs) + '</b>' + (r.超时秒 ? ' / ' + clock(r.超时秒) : '') : dur(secs)) + '</div>' +
-      '<div><span>步数</span>' + (r.步数 || 0) + '</div>' +
-      '<div><span>tokens</span>' + tok + '</div>' +
-      '<div><span>费用</span>' + (r.费用 != null ? '$' + r.费用.toFixed(4) : r.工人 === 'codex' ? '订阅额度' : '—') + '</div>' +
+      '<div><span>用时</span>' + (r.状态 === 'running' ? '<b data-since="' + esc(r.开始) + '">' + esc(clock(secs)) + '</b>' + (r.超时秒 ? ' / ' + esc(clock(r.超时秒)) : '') : esc(dur(secs))) + '</div>' +
+      '<div><span>步数</span>' + esc(r.步数 || 0) + '</div>' +
+      '<div><span>tokens</span>' + esc(tok) + '</div>' +
+      '<div><span>费用</span>' + esc(r.费用 != null ? '$' + r.费用.toFixed(4) : r.工人 === 'codex' ? '订阅额度' : '—') + '</div>' +
       (r.退出码 != null ? '<div><span>退出码</span>' + esc(r.退出码) + '</div>' : '') + '</div>';
   }
   h += '<div class="tabs">' + TABS.map(([k, n]) => '<button class="tab' + (o.tab === k ? ' on' : '') + '" data-tab-pick="' + k + '">' + n + '</button>').join('') + '</div>';
@@ -530,16 +694,16 @@ function renderDrawer() {
   const body = $('db');
   const atBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 40;
   let b = '';
-  if (!r && o.tab !== 'kanban') b = '<div class="muted">这件活还没有执行记录（只有登记记录）。</div>';
+  if (!r && o.tab !== 'kanban') b = '<div class="muted">' + (rawRound ? '正在加载这一轮…' : '这件活还没有执行记录（只有登记记录）。') + '</div>';
   else if (o.tab === 'progress') {
     b = (r.状态 === 'running' ? '<div class="box blue"><i class="dot pulse" style="color:var(--done)"></i> 正在干活，每 2 秒自动更新</div>' : '') +
-      (r.时间线总数 > r.时间线.length ? '<div class="muted" style="font-size:12px;margin-bottom:6px">共 ' + r.时间线总数 + ' 条，只显示最后 ' + r.时间线.length + ' 条</div>' : '') +
-      (r.时间线.length ? '<ul class="tl">' + r.时间线.map(x => '<li class="' + esc(x.k) + '"><span class="ic">' + (ICON[x.k] || '·') + '</span><span class="s">' + esc(x.s) + '</span><span class="tm">' + esc(tm(x.t)) + '</span>' +
+      (r.时间线总数 > r.时间线.length ? '<div class="muted" style="font-size:12px;margin-bottom:6px">共 ' + esc(r.时间线总数) + ' 条，只显示最后 ' + r.时间线.length + ' 条</div>' : '') +
+      (r.时间线.length ? '<ul class="tl">' + r.时间线.map(x => '<li class="' + esc(x.k) + '"><span class="ic">' + esc(ICON[x.k] || '·') + '</span><span class="s">' + esc(x.s) + '</span><span class="tm">' + esc(tm(x.t)) + '</span>' +
         (x.d ? '<details><summary>细节</summary><pre>' + esc(x.d) + '</pre></details>' : '') + '</li>').join('') + '</ul>' : '<div class="muted">还没有动静。</div>');
   } else if (o.tab === 'result') {
     if (r.需输入) b += '<div class="box amber"><h4>工人停下来等输入</h4>' + esc(r.需输入) + '</div>';
     if (r.决策披露) b += '<div class="box blue"><h4>决策披露（工人自己做主的地方）</h4><pre>' + esc(r.决策披露) + '</pre></div>';
-    if (r.验收) b += '<div class="box gray">验收结论：<b>' + esc(r.验收) + '</b>（由派活的大脑核对证据后给出，不是工人自评）</div>';
+    b += '<div class="box gray">验收结论：<b>' + esc(r.验收 || '未验收') + '</b>（由派活的大脑核对证据后给出，不是工人自评）</div>';
     b += r.交付说明 ? '<pre class="doc">' + esc(r.交付说明) + '</pre>' : '<div class="muted">' + (r.状态 === 'running' ? '还在干活，做完才有交付说明。' : '没有交付说明（结果.txt）。') + '</div>';
   } else if (o.tab === 'card') {
     b = r.任务卡 ? '<pre class="doc">' + esc(r.任务卡) + '</pre>' : '<div class="muted">没找到任务卡。</div>';
@@ -552,7 +716,8 @@ function renderDrawer() {
         '<pre class="doc">' + esc(S.fileView.text) + '</pre>';
     } else {
       b = '<div class="muted" style="font-size:12px;margin-bottom:6px">本轮目录里的文件（工人只能在这里读写）。点文件名查看。</div><ul class="files">' +
-        r.文件.map(f => '<li><button class="linkbtn" data-file="' + esc(f.路径) + '">' + esc(f.路径) + '</button><span class="muted">' + fsize(f.大小) + '</span></li>').join('') + '</ul>';
+        r.文件.map(f => '<li><button class="linkbtn" data-file="' + esc(f.路径) + '">' + esc(f.路径) + '</button><span class="muted">' + esc(fsize(f.大小)) + '</span></li>').join('') +
+        (r.文件列表已截断 ? '<li class="muted">还有更多文件未列出</li>' : '') + '</ul>';
     }
   } else if (o.tab === 'kanban') {
     const k = d.看板;
@@ -575,15 +740,22 @@ function renderDrawer() {
   }
   tick();
 }
-function fsize(n) { return n < 1024 ? n + ' B' : n < 1048576 ? (n / 1024).toFixed(1) + ' KB' : (n / 1048576).toFixed(1) + ' MB'; }
+function fsize(n) { n = finiteNumber(n); if (n == null) return '—'; return n < 1024 ? n + ' B' : n < 1048576 ? (n / 1024).toFixed(1) + ' KB' : (n / 1048576).toFixed(1) + ' MB'; }
 
 async function openFile(path) {
   const o = S.open; if (!o) return;
+  const id = o.id, round = o.round, request = ++fileRequest;
+  const current = () => request === fileRequest && S.open === o &&
+    S.open.id === id && S.open.round === round && S.open.tab === 'files';
   try {
-    const r = await fetch('/api/file?id=' + encodeURIComponent(o.id) + '&round=' + encodeURIComponent(o.round) + '&path=' + encodeURIComponent(path));
+    const r = await fetch('/api/file?id=' + encodeURIComponent(id) + '&round=' + encodeURIComponent(round) + '&path=' + encodeURIComponent(path));
     const d = await r.json();
+    if (!current()) return;
     S.fileView = { path, text: d.内容 != null ? d.内容 : (d.错误 || '读不到') };
-  } catch (e) { S.fileView = { path, text: '读不到：' + e }; }
+  } catch (e) {
+    if (!current()) return;
+    S.fileView = { path, text: '读不到：' + e };
+  }
   renderDrawer(); $('db').scrollTop = 0;
 }
 
@@ -606,6 +778,10 @@ function readHash() {
 window.addEventListener('hashchange', readHash);
 
 // ================= 6. 点击和键盘 =================
+document.addEventListener('toggle', ev => {
+  const key = ev.target.dataset && ev.target.dataset.panelDetail;
+  if (key) { if (ev.target.open) panelExpanded.add(key); else panelExpanded.delete(key); }
+}, true);
 document.addEventListener('click', (ev) => {
   const t = ev.target.closest('[data-open],[data-dismiss],[data-undismiss],[data-morerecent],[data-close],[data-round-pick],[data-tab-pick],[data-file],[data-file-back]');
   if (!t) return;
@@ -614,10 +790,10 @@ document.addEventListener('click', (ev) => {
   if (ds.undismiss) { dismissed = {}; saveDismissed(dismissed); render(); return; }
   if (ds.morerecent) { S.showAllRecent = !S.showAllRecent; render(); return; }
   if (ds.close) { closeTask(); return; }
-  if (ds.roundPick) { S.open.round = ds.roundPick; S.fileView = null; writeHash(); renderDrawer(); loadDetail(); return; }
-  if (ds.tabPick) { S.open.tab = ds.tabPick; S.fileView = null; writeHash(); renderDrawer(); return; }
+  if (ds.roundPick) { ++fileRequest; S.open.round = ds.roundPick; S.fileView = null; writeHash(); renderDrawer(); loadDetail(); return; }
+  if (ds.tabPick) { ++fileRequest; S.open.tab = ds.tabPick; S.fileView = null; writeHash(); renderDrawer(); return; }
   if (ds.file) { openFile(ds.file); return; }
-  if (ds.fileBack) { S.fileView = null; renderDrawer(); return; }
+  if (ds.fileBack) { ++fileRequest; S.fileView = null; renderDrawer(); return; }
   if (ds.open) { openTask(ds.open, ds.round, ds.tab); }
 });
 $('shade').addEventListener('click', closeTask);
@@ -626,8 +802,7 @@ $('project').addEventListener('change', (ev) => { S.project = ev.target.value; S
 
 // 切项目时立刻拉一次（不打乱 3 秒一次的节奏）
 async function poll0() {
-  try { const res = await getJSON('/api/state?project=' + encodeURIComponent(S.project)); if (!res.ok) throw new Error('HTTP ' + res.status); S.data = res.d; S.lastOk = Date.now(); S.failing = false; render(); } catch (e) { S.failing = true; report('切换项目', e); }
-  renderLive();
+  await refreshState();
 }
 
 readHash();

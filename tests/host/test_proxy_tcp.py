@@ -16,9 +16,12 @@ class ProcessTests(unittest.TestCase):
     def test_first_stdout_line_is_port_and_shutdown_reports_count(self):
         # 真正启动 CLI，给它一个本地拒绝请求，再用 TERM 验证可退出且输出可信计数。
         with tempfile.TemporaryDirectory() as tmp:
-            child = subprocess.Popen([sys.executable, "-I", str(SCRIPT), "--allow", "api.deepseek.com:443",
+            child = subprocess.Popen([sys.executable, "-I", str(SCRIPT), "--provider", "deepseek",
                                       "--log", str(Path(tmp) / "拒绝.log"), "--parent-pid", str(os.getpid())],
-                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env={})
+            child.stdin.write('FAKE-HOST-TCP-KEY\n')
+            child.stdin.close()
+            child.stdin = None
             try:
                 self.assertTrue(select.select([child.stdout], [], [], 5)[0], "代理启动超时")
                 first = child.stdout.readline().strip()
@@ -47,8 +50,10 @@ class ProcessTests(unittest.TestCase):
             source = """
 import os, subprocess, sys, time
 with open(sys.argv[2], 'w') as output:
-    child = subprocess.Popen([sys.executable, '-I', sys.argv[1], '--allow', 'api.deepseek.com:443',
-                              '--log', sys.argv[3]], stdout=output)
+    child = subprocess.Popen([sys.executable, '-I', sys.argv[1], '--provider', 'deepseek',
+                              '--log', sys.argv[3]], stdin=subprocess.PIPE, stdout=output, env={})
+    child.stdin.write(b'FAKE-HOST-TCP-KEY\\n')
+    child.stdin.close()
     print(child.pid, flush=True)
     time.sleep(60)
 """

@@ -10,6 +10,11 @@ spec = importlib.util.spec_from_file_location('calibrate_checker', ROOT / 'demo/
 check = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(check)
 
+regression_spec = importlib.util.spec_from_file_location('demo_check_regression', ROOT / 'demo/test_check.py')
+regressions = importlib.util.module_from_spec(regression_spec)
+regression_spec.loader.exec_module(regressions)
+CheckerRegressionTests = regressions.CheckerRegressionTests
+
 # 正确实现只存在于测试里，派给真实工人的材料没有参考答案。
 SOLUTIONS = {
     'sort': '# 排序保留空行和重复项。\nimport sys\nrows=sorted(sys.stdin.read().splitlines())\nsys.stdout.write("".join(row+"\\n" for row in rows))\n',
@@ -35,12 +40,12 @@ class CalibrationTests(unittest.TestCase):
     def test_empty_output_rejected_for_every_question(self):
         (self.directory / 'solve.py').write_text('# 不合格实现：没有输出\n')
         for question in self.questions:
-            with self.subTest(question=question['id']), self.assertRaises(check.CheckError):
+            with self.subTest(question=question['id']), self.assertRaisesRegex(check.CheckError, question["id"] + " 正常用例未通过"):
                 check.grade(self.directory, question)
 
     def test_bool_is_not_integer(self):
         (self.directory / 'solve.py').write_text('# 故障：把 bool 当成 int\nimport sys,json\nprint(sum(json.load(sys.stdin)))\n')
-        with self.assertRaises(check.CheckError):
+        with self.assertRaisesRegex(check.CheckError, "sum 非法输入用例未通过"):
             check.grade(self.directory, self.questions[1])
 
     def test_symbolic_link_artifact_rejected(self):

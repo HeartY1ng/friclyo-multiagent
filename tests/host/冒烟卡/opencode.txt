@@ -1,0 +1,4 @@
+项目：frclyo-multiagent
+# OpenCode 短卡（验收器分配 TEST-时间戳任务号，不进账本）
+遵守入口注入的工人守则。在入口指定的本轮目录新建 model-sentinel.txt，内容严格为 UTF-8 的 MODEL_API_OK 加一个换行，无其他内容。
+按五段格式回复，说明完成情况。不要自行写回执.json，回执由宿主入口生成。

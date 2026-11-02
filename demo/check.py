@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 # 三关验收只使用固定材料和实际执行结果，不信任工人的口头结论。
 import json
+import importlib.util
 import os
 from pathlib import Path
 import signal
+import shutil
+import stat
+import tempfile
 import subprocess
 import sys
 
@@ -12,17 +16,110 @@ class CheckError(Exception):
     """验收失败的简短原因，会写入父子账本。"""
 
 
-def execute(argv, cwd, data=None, timeout=30):
-    """独立进程组控制超时；避免失败测试留下后台子进程。"""
-    process = subprocess.Popen([str(v) for v in argv], cwd=str(cwd), stdin=subprocess.PIPE,
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
-    try:
-        out, err = process.communicate(data, timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        os.killpg(process.pid, signal.SIGKILL)
-        process.communicate()
-        raise CheckError('验收命令超时') from exc
-    return process.returncode, out, err
+def sandbox_profile(workspace):
+    """沿用框架敏感目录清单；写入只放行本次副本，网络全部拒绝。"""
+    spec = importlib.util.spec_from_file_location(
+        'checker_isolation', Path(__file__).resolve().parents[1] / 'bin/frclyo/isolation.py')
+    isolation = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(isolation)
+    home = Path.home()
+    secrets = [home / name for name in isolation.SECRET_NAMES]
+    secrets.extend(Path(os.environ[name]).expanduser() for name in ('CODEX_HOME', 'FRCLYO_CONFIG')
+                   if os.environ.get(name))
+    secrets.append(Path(os.environ.get('FRCLYO_HOME', str(home / 'AgentWork'))) / '配置')
+    quote = lambda path: json.dumps(str(Path(path).resolve()), ensure_ascii=False)
+    return '\n'.join(['(version 1)', '(allow default)', '(deny network*)',
+                      '(deny file-write*)',
+                      '(allow file-write* (subpath %s))' % quote(workspace),
+                      '(deny file-read* %s)' % ' '.join('(subpath %s)' % quote(p) for p in secrets)])
+
+
+def copy_artifacts(source, destination):
+    """不跟随工人链接，也不读取设备、管道等特殊节点。"""
+    source = Path(source)
+    if source.is_symlink() or not source.is_dir():
+        raise CheckError('产物目录必须是普通目录')
+    destination.mkdir()
+    for path in source.iterdir():
+        mode = path.lstat().st_mode
+        if stat.S_ISDIR(mode):
+            copy_artifacts(path, destination / path.name)
+        elif stat.S_ISREG(mode):
+            shutil.copyfile(path, destination / path.name)
+        else:
+            raise CheckError('产物包含链接或特殊文件')
+
+
+def execute(argv, cwd, data=None, timeout=30, *, inputs=(), outputs=()):
+    """每次在新副本中强制套 macOS 沙箱；不可用时失败，绝不裸跑。"""
+    cwd = Path(cwd).resolve()
+    with tempfile.TemporaryDirectory(prefix='frclyo-check-') as temporary:
+        workspace = Path(temporary).resolve()
+        work = workspace / 'work'
+        copy_artifacts(cwd, work)
+        mapping = {str(cwd): str(work)}
+        for index, source in enumerate(inputs):
+            source = Path(source).absolute()
+            container = workspace / ('input-%d' % index)
+            container.mkdir()
+            staged = container / source.name
+            shutil.copyfile(regular(source.parent, source.name), staged)
+            mapping[str(source)] = str(staged)
+        staged_outputs = []
+        for index, destination in enumerate(outputs):
+            destination = Path(destination).absolute()
+            staged = workspace / ('output-%d' % index)
+            mapping[str(destination)] = str(staged)
+            staged_outputs.append((staged, destination))
+        def remap(value):
+            value = str(value)
+            if value in mapping:
+                return mapping[value]
+            if value.startswith(str(cwd) + os.sep):
+                return str(work / Path(value).relative_to(cwd))
+            return value
+        # 不把宿主环境中的 API key、Python 注入配置传给交付代码。
+        env = {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'HOME': str(workspace),
+               'TMPDIR': str(workspace), 'TMP': str(workspace), 'TEMP': str(workspace),
+               'LANG': 'en_US.UTF-8', 'PYTHONDONTWRITEBYTECODE': '1'}
+        # 只有沙箱内启动器确实等到命令退出，才写完成凭据。
+        # sandbox-exec 自身的拒绝/错误不能冒充坏输入的预期非零退出。
+        status = workspace / 'execution-status.json'
+        runner = ('import json,pathlib,subprocess,sys; '
+                  'result=subprocess.run(sys.argv[2:]); '
+                  'pathlib.Path(sys.argv[1]).write_text(json.dumps(result.returncode)); '
+                  'sys.exit(0)')
+        command = ['/usr/bin/sandbox-exec', '-p', sandbox_profile(workspace),
+                   sys.executable, '-I', '-c', runner, str(status)] + [remap(v) for v in argv]
+        try:
+            process = subprocess.Popen(command, cwd=str(work), env=env, stdin=subprocess.PIPE,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        except OSError as exc:
+            raise CheckError('无法启动 macOS 验收沙箱') from exc
+        try:
+            out, err = process.communicate(data, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate()
+            raise CheckError('验收命令超时') from exc
+        finally:
+            # 正常退出也回收后代，防止副本清理或复制输出时仍有后台写入。
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if process.returncode != 0:
+            raise CheckError('验收沙箱运行失败')
+        try:
+            rc = json.loads(regular(workspace, status.name).read_text())
+        except (OSError, ValueError) as exc:
+            raise CheckError('验收命令缺少有效完成凭据') from exc
+        if type(rc) is not int or rc < 0 or b'Traceback (most recent call last):' in err:
+            raise CheckError('验收命令运行出错')
+        for staged, destination in staged_outputs:
+            if staged.exists() or staged.is_symlink():
+                destination.write_bytes(regular(workspace, staged.name).read_bytes())
+        return rc, out, err
 
 
 def regular(directory, name):
@@ -41,8 +138,10 @@ def compare(actual, expected, label):
 
 def run_csv(directory, script, source, destination):
     """每次执行使用新的输出路径，避免旧产物冒充新结果。"""
+    directory, source, destination = (Path(p).absolute() for p in (directory, source, destination))
     destination.unlink(missing_ok=True)
-    rc, _, _ = execute([sys.executable, regular(directory, script), source, destination], directory)
+    rc, _, _ = execute([sys.executable, regular(directory, script), source, destination], directory,
+                       inputs=(source,), outputs=(destination,))
     if rc or not destination.is_file() or destination.is_symlink():
         raise CheckError(script + ' 执行失败或未生成输出')
     return destination.read_bytes()
@@ -50,6 +149,7 @@ def run_csv(directory, script, source, destination):
 
 def demo_gates(a, b, samples, checks):
     """任何一关失败都抛出异常；调用方负责写入账本及保留证据。"""
+    a, b, samples, checks = (Path(p).absolute() for p in (a, b, samples, checks))
     checks.mkdir(parents=True, exist_ok=False)
     normalized = (samples / 'normalized.expected.csv').read_bytes()
     summary = (samples / 'summary.expected.csv').read_bytes()
@@ -62,15 +162,14 @@ def demo_gates(a, b, samples, checks):
     # 第二关强制加载指定测试模块，零测试不能算成功；完整输出留作证据。
     runner = ('import sys,unittest; sys.path.insert(0,sys.argv[1]); '
               'suite=unittest.defaultTestLoader.loadTestsFromName(sys.argv[2]); '
-              'count=suite.countTestCases(); '
               'result=unittest.TextTestRunner(verbosity=2).run(suite); '
-              'sys.exit(0 if count>=4 and result.wasSuccessful() else 1)')
+              'sys.exit(0 if result.testsRun>=4 and not result.skipped and result.wasSuccessful() else 1)')
     for directory, module in ((a, 'test_normalize'), (b, 'test_summarize')):
         regular(directory, module + '.py')
         rc, out, err = execute([sys.executable, '-I', '-c', runner, directory, module], directory)
         (checks / (module + '.log')).write_bytes(out + err)
         if rc:
-            raise CheckError(module + ' 未通过，或测试不足 4 项')
+            raise CheckError(module + ' 未通过、存在跳过，或实际测试不足 4 项')
     # 补充父级边界用例，不仅依赖工人自己写的测试。
     empty = checks / 'empty.csv'
     empty.write_bytes(b'name,category,amount\n')
@@ -81,7 +180,8 @@ def demo_gates(a, b, samples, checks):
         bad = checks / ('bad-' + script + '.csv')
         bad.write_bytes(invalid)
         output = checks / ('invalid-' + script + '.csv')
-        rc, _, err = execute([sys.executable, directory / script, bad, output], directory)
+        rc, _, err = execute([sys.executable, directory / script, bad, output], directory,
+                             inputs=(bad,), outputs=(output,))
         if rc == 0 or not err or output.exists():
             raise CheckError(script + ' 没有按契约拒绝坏输入')
     print('✅ 第二关：两边测试及父级边界检查通过', flush=True)
@@ -95,6 +195,7 @@ def demo_gates(a, b, samples, checks):
 
 def grade(directory, question):
     """校准评分覆盖正常与错误输入，输出按字节检查，不让工人提供分数。"""
+    directory = Path(directory).absolute()
     script = regular(directory, 'solve.py')
     for data, expected in question['cases']:
         rc, out, _ = execute([sys.executable, script], directory, data.encode('utf-8'))

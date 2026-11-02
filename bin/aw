@@ -1,7 +1,7 @@
 #!/bin/bash
 """:"
 # bash 3.2 与 Python 共用入口；保留 stdin 给确认和隐藏密钥输入。
-command -v python3 >/dev/null 2>&1 || { echo '❌ 需要 Python 3.9 或以上版本' >&2; exit 2; }
+command -v python3 >/dev/null 2>&1 || { echo '❌ 需要 Python 3.9 或以上版本' >&2; exit 1; }
 exec python3 "$0" "$@"
 ":"""
 # 所有配置读取只走运行时公共库；本文件不解析 config.json。
@@ -9,6 +9,7 @@ import concurrent.futures
 import contextlib
 import fcntl
 import functools
+import errno
 import hashlib
 import importlib
 import importlib.util
@@ -31,8 +32,9 @@ import uuid
 
 ROOT = Path(__file__).resolve().parent.parent
 HOME = Path.home()
-STATE = HOME / '.frclyo'
-JOURNAL = STATE / '安装记录.jsonl'
+sys.path.insert(0, str(ROOT / 'bin'))
+from frclyo import config as config_runtime
+# 状态路径按需校验，导入和帮助不接触数据根。
 LABEL = 'com.frclyo.board'
 ACTIVE_WORKERS = set()
 WORKER_LOCK = threading.Lock()
@@ -41,6 +43,30 @@ sys.path.insert(0, str(ROOT / 'bin'))
 
 class UserError(Exception):
     """只向用户展示不含密钥的已知错误。"""
+
+
+class UsageError(UserError):
+    """参数语法错误，退出 2；运行故障仍使用 UserError，退出 1。"""
+
+
+def state_path():
+    try:
+        return config_runtime.root_dir() / '配置'
+    except (OSError, ValueError) as exc:
+        raise UserError('数据根无效；请检查 FRCLYO_HOME，使用仓库、桌面、文稿和云盘之外的可访问目录') from exc
+
+
+def journal_path():
+    return state_path() / '安装记录.jsonl'
+
+
+def __getattr__(name):
+    # 保留模块消费者已有的只读路径属性。
+    if name == 'STATE':
+        return state_path()
+    if name == 'JOURNAL':
+        return journal_path()
+    raise AttributeError(name)
 
 
 def runtime(name):
@@ -54,6 +80,7 @@ def runtime(name):
 def config():
     """配置错误不原样打印，避免泄露配置中误填的敏感信息。"""
     try:
+        state_path()
         return runtime('config').load()
     except UserError:
         raise
@@ -68,7 +95,7 @@ def path_of(name):
 
 def config_path():
     """契约明确了配置位置；这里仅定位文件，不读取其内容。"""
-    return Path(os.environ.get('FRCLYO_CONFIG', str(STATE / 'config.json'))).expanduser().absolute()
+    return runtime('config').config_file(for_write=True)
 
 
 def confirm(prompt, mode=None):
@@ -85,9 +112,9 @@ def confirm(prompt, mode=None):
 def mode_flags(args, extras=()):
     """拒绝拼错的参数和互相冲突的自动回答，防止意外安装。"""
     if '--yes' in args and '--no-input' in args:
-        raise UserError('--yes 和 --no-input 不能同时使用')
+        raise UsageError('--yes 和 --no-input 不能同时使用')
     if any(arg not in ('--yes', '--no-input') + tuple(extras) for arg in args):
-        raise UserError('不认识的参数；请运行 aw help')
+        raise UsageError('不认识的参数；请运行 aw help')
     return True if '--yes' in args else False if '--no-input' in args else None
 
 
@@ -114,7 +141,7 @@ def append_json(path, row):
 
 def record(action, **fields):
     """每个计划先记账，完成后记完成；中断后也能按计划安全撤销。"""
-    append_json(JOURNAL, dict(time=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+    append_json(journal_path(), dict(time=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
                              action=action, **fields))
 
 
@@ -156,9 +183,17 @@ def install_file(path, data=None, target=None, category='install'):
     if target:
         path.symlink_to(target)
     else:
-        with path.open('xb') as stream:
-            stream.write(data)
-        path.chmod(0o600 if category == 'config' else 0o644)
+        fd, temporary = tempfile.mkstemp(prefix='.' + path.name + '.', dir=str(path.parent))
+        try:
+            with os.fdopen(fd, 'wb') as stream:
+                stream.write(data)
+                stream.flush()
+                os.fchmod(stream.fileno(), 0o600 if category == 'config' else 0o644)
+                os.fsync(stream.fileno())
+            # 同目录硬链接原子发布；目标被并发占用时失败，绝不覆盖。
+            os.link(temporary, path)
+        finally:
+            os.unlink(temporary)
     record('done', id=token)
     return True
 
@@ -190,7 +225,9 @@ def tools_report():
             ok = capture(['codex', 'login', 'status']).returncode == 0
         except UserError:
             ok = False
-        print(('✅ Codex 已登录' if ok else '❌ Codex 未登录；请自行运行 codex login'))
+        print(('✅ Codex 已登录' if ok else '❌ Codex 未登录或登录检查失败；请自行运行 codex login'))
+        if not ok:
+            found.pop('codex', None)
     return found
 
 
@@ -235,7 +272,7 @@ def board(args):
     aliases = {'启动': 'start', '停止': 'stop', '打开': 'open', '状态': 'status'}
     action = aliases.get(args[0], args[0]) if args else 'open'
     if len(args) > 1 or action not in ('start', 'stop', 'open', 'status'):
-        raise UserError('用法：aw board [start|stop|open|status]')
+        raise UsageError('用法：aw board [start|stop|open|status]')
     port = config()['board_port']
     url = 'http://127.0.0.1:' + str(port)
     if action == 'status':
@@ -338,13 +375,13 @@ def finish_batch(task, passed, summary):
 
 def journal_begin():
     """首次建记录时登记自己的目录；已有记录从不截断。"""
-    if JOURNAL.is_symlink() or STATE.is_symlink():
+    if journal_path().is_symlink() or state_path().is_symlink():
         raise UserError('安装记录或状态目录是符号链接，停止以免改到其他位置')
-    fresh = not STATE.exists()
-    STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fresh = not state_path().exists()
+    state_path().mkdir(mode=0o700, parents=True, exist_ok=True)
     if fresh:
         token = uuid.uuid4().hex
-        record('plan', id=token, kind='directory', path=str(STATE), category='config')
+        record('plan', id=token, kind='directory', path=str(state_path()), category='config')
         record('done', id=token)
 
 
@@ -359,7 +396,10 @@ def install(args):
     tools_report()
     record('check', name='tools', success=True)
     current = config()
-    if not config_path().exists():
+    if runtime('config').migration_needed():
+        print('⚠️ 请迁移旧配置到根目录 配置/config.json；安装器不自动搬运')
+        record('skip', name='config', reason='旧配置待人工迁移')
+    elif not config_path().exists():
         if confirm('创建 frclyo 配置？', mode):
             # 非交互全是模式不猜代理地址；只有用户提供 URL 才能启用代理。
             proxy = ''
@@ -378,17 +418,16 @@ def install(args):
             record('skip', name='config', reason='用户选择否')
     else:
         record('skip', name='config', reason='保留已有配置')
-    work = path_of('work_dir')
-    if work.exists():
-        if not work.is_dir():
-            raise UserError('work_dir 不是目录')
-        record('skip', name='work_dir', reason='保留已有目录')
-    elif confirm('创建工作目录 ' + str(work) + '？', mode):
-        ensure_dirs(work, 'data')
-    else:
-        record('skip', name='work_dir', reason='用户选择否')
+    # 契约目录逐个补齐，已有目录不动；README 与大脑入口由切换阶段手写。
+    for name in ('work_dir', 'config_dir', 'framework_dir', 'development_dir', 'cards_dir',
+                 'deliver_dir', 'assets_dir', 'projects_dir', 'runtime_dir', 'control_dir', 'records_dir',
+                 'backup_dir', 'archive_dir'):
+        directory = path_of(name)
+        if directory.exists() and not directory.is_dir():
+            raise UserError('布局路径不是目录：' + name)
+        ensure_dirs(directory, 'data')
     if confirm('把 aw 链接到 ~/.local/bin/aw？', mode):
-        install_file(HOME / '.local/bin/aw', target=ROOT / 'bin/aw')
+        install_file(HOME / '.local/bin/aw', target=runtime('release').installed_entry(ROOT) / 'bin/aw')
         if str(HOME / '.local/bin') not in os.environ.get('PATH', '').split(os.pathsep):
             print('PATH 尚未包含 ~/.local/bin；可在 shell 配置加入：export PATH="$HOME/.local/bin:$PATH"')
     else:
@@ -398,11 +437,12 @@ def install(args):
         if not source.is_file():
             raise UserError('缺少 adapters/claude/SKILL.md；请检查仓库是否完整')
         content = source.read_text(encoding='utf-8')
+        entry = runtime('release').installed_entry(ROOT)
         # 支持常见路径占位符，同时附上明确的实际入口，避免依赖 shell 展开。
         for marker in ('{{REPO}}', '{{REPO_ROOT}}', '__REPO_ROOT__', '<REPO_ROOT>'):
-            content = content.replace(marker, str(ROOT))
-        content += '\n\n<!-- aw 安装时定位 -->\n实际仓库位置：`' + str(ROOT) + '`\n'
-        content += '请读取 `' + str(ROOT / '大脑手册.md') + '`。\n'
+            content = content.replace(marker, str(entry))
+        content += '\n\n<!-- aw 安装时定位 -->\n实际仓库位置：`' + str(entry) + '`\n'
+        content += '请读取 `' + str(entry / '大脑手册.md') + '`。\n'
         install_file(HOME / '.claude/skills/frclyo-brain/SKILL.md', content.encode('utf-8'))
     else:
         record('skip', name='claude-skill', reason='用户选择否')
@@ -411,11 +451,12 @@ def install(args):
             raise UserError('缺少 board/board.py；请检查仓库是否完整后重跑安装')
         plist_path = HOME / 'Library/LaunchAgents' / (LABEL + '.plist')
         # plistlib 负责 XML 转义，路径含空格、中文或 & 也能正确解析。
-        spec = {'Label': LABEL, 'ProgramArguments': [sys.executable, str(ROOT / 'board/board.py')],
-                'WorkingDirectory': str(ROOT), 'RunAtLoad': True, 'KeepAlive': True,
+        spec = {'Label': LABEL, 'ProgramArguments': [sys.executable, str(runtime('release').installed_entry(ROOT) / 'board/board.py')],
+                'WorkingDirectory': str(runtime('release').installed_entry(ROOT)), 'RunAtLoad': True, 'KeepAlive': True,
+                'StandardOutPath': str(path_of('board_log_file')), 'StandardErrorPath': str(path_of('board_log_file')),
                 'ThrottleInterval': 30, 'EnvironmentVariables': {
                     'HOME': str(HOME), 'PATH': os.environ.get('PATH', ''),
-                    'FRCLYO_CONFIG': str(config_path())}}
+                    'FRCLYO_HOME': str(path_of('work_dir'))}}
         if 'CODEX_HOME' in os.environ:
             spec['EnvironmentVariables']['CODEX_HOME'] = str(runtime('config').codex_home())
         install_file(plist_path, plistlib.dumps(spec, sort_keys=True))
@@ -424,7 +465,8 @@ def install(args):
             already = launchctl('print', 'gui/' + str(os.getuid()) + '/' + LABEL) == 0
         if not already:
             token = uuid.uuid4().hex
-            record('plan', id=token, kind='launchd', path=str(plist_path))
+            record('plan', id=token, kind='launchd', path=str(plist_path),
+                   expected=fingerprint(plist_path), started_by_install=True)
             if launchctl('bootstrap', 'gui/' + str(os.getuid()), str(plist_path)):
                 raise UserError('launchd 启动失败；安装记录已保留，可以重跑或卸载')
             record('done', id=token)
@@ -438,12 +480,15 @@ def install(args):
 
 def read_journal():
     """坏尾行也报错，不在安装记录损坏时猜测删除对象。"""
-    if not JOURNAL.exists():
+    if not journal_path().exists():
         return []
-    if JOURNAL.is_symlink():
+    if journal_path().is_symlink():
         raise UserError('安装记录是符号链接，拒绝读取和撤销')
     try:
-        rows = [json.loads(line) for line in JOURNAL.read_text(encoding='utf-8').splitlines()]
+        lines = journal_path().read_bytes().decode('utf-8').split('\n')
+        if lines[-1] == '':
+            lines.pop()
+        rows = [json.loads(line) for line in lines]
         if not all(isinstance(row, dict) and 'action' in row for row in rows):
             raise ValueError()
         # 完成事件补充实际文件指纹；未完成的配置计划缺指纹时卸载会保守保留。
@@ -458,7 +503,7 @@ def read_journal():
 
 def uninstall(args):
     """反序撤销；默认保留配置和工作数据，dry-run 不写记录也不执行命令。"""
-    mode = mode_flags(args, ('--dry-run',))
+    mode = mode_flags(args, ('--dry-run', '--delete-data'))
     dry = '--dry-run' in args
     rows = read_journal()
     if not rows:
@@ -466,17 +511,28 @@ def uninstall(args):
         return 0
     if not dry and not confirm('按安装记录撤销链接、Claude 技能和 launchd？', mode):
         return 0
-    delete_config = False if dry else confirm('删除配置和安装记录？默认保留', mode)
-    delete_data = False if dry else confirm('删除 work_dir 全部数据？默认保留', mode)
-    work = path_of('work_dir') if delete_data else None
+    # --yes 只确认撤销安装；删除必须另有显式开关和完整路径输入。
+    delete_data = '--delete-data' in args and '--no-input' not in args and not dry
+    work = config_runtime.root_dir()
     undone = {row.get('id') for row in rows if row['action'] == 'undone'}
     plans = [row for row in rows if row['action'] == 'plan' and row.get('id') not in undone]
     blocked = False
-    for row in reversed(plans):
+    pending_services = {p['id']: Path(p['path']) for p in plans if p.get('kind') == 'launchd'}
+    # 同一路径对应本工具唯一的服务；已撤销的最新计划也必须参与判断，支持中断后重试。
+    latest_services = {p['path']: p for p in rows if p['action'] == 'plan'
+                       and p.get('kind') == 'launchd' and p.get('category', 'install') == 'install'}
+    # 服务先于其依赖文件撤销，兼容重装后交错的记录。
+    ordered = sorted(reversed(plans), key=lambda p: p.get('kind') != 'launchd')
+    for row in ordered:
         kind, category = row.get('kind'), row.get('category', 'install')
-        if category == 'config' and not delete_config or category == 'data':
+        if category in ('config', 'data'):
             continue
-        path = Path(row.get('path', str(STATE)))
+        # 未知分类不能跳过外部安装路径白名单，否则坏记录可能删到数据。
+        if category != 'install':
+            print('❌ 未知安装记录分类，保留该项')
+            blocked = True
+            continue
+        path = Path(row.get('path', str(state_path())))
         print(('将撤销：' if dry else '撤销：') + kind + ' ' + str(path))
         if dry:
             continue
@@ -487,30 +543,48 @@ def uninstall(args):
                 valid = path in allowed if kind != 'directory' else any(path in p.parents and path != HOME for p in allowed)
                 if not valid or not path.parent.resolve().is_relative_to(HOME.resolve()):
                     raise UserError('记录中的安装路径不在允许范围，拒绝删除')
+            if kind in ('file', 'directory') and any(
+                    path == dependency or path in dependency.parents
+                    for dependency in pending_services.values()):
+                raise UserError('服务尚未确认停止，保留依赖：' + str(path))
             if kind == 'launchd':
+                latest = latest_services[str(path)]
+                if row['id'] != latest['id']:
+                    if latest['id'] not in undone:
+                        raise UserError('最新安装的服务尚未确认停止，保留旧记录及依赖')
+                    # 最新服务已确认停止，旧指纹不再代表当前服务；文件仍自行核对指纹。
+                    record('undone', id=row['id'])
+                    pending_services.pop(row['id'], None)
+                    continue
                 # 文件被用户替换时不再碰同名服务，保留记录供人工确认。
-                matching = any(p.get('kind') == 'file' and p.get('path') == str(path)
-                               and p.get('expected') == fingerprint(path) for p in plans)
+                actual = fingerprint(path)
+                matching = (row['expected'] == actual if row.get('expected') else
+                            any(p.get('kind') == 'file' and p.get('path') == str(path)
+                                and p.get('expected') == actual for p in plans))
                 if path.exists() and not matching:
                     raise UserError('launchd plist 已变化，保留服务')
                 service = 'gui/' + str(os.getuid()) + '/' + LABEL
                 rc = launchctl('bootout', service)
-                if rc and launchctl('print', service) == 0:
-                    raise UserError('launchd 仍在运行，保留记录')
+                if rc:
+                    status = launchctl('print', service)
+                    if status != 113:
+                        raise UserError('launchd 停止失败；' + ('仍在运行' if status == 0 else '无法确认服务状态') + '，保留记录及依赖')
+                pending_services.pop(row['id'], None)
             elif kind == 'file':
                 if path.exists() or path.is_symlink():
                     if category != 'config' and fingerprint(path) != row.get('expected'):
                         raise UserError('文件已被修改，保留：' + str(path))
                     path.unlink()
             elif kind == 'directory':
-                if path == STATE:
+                if path == state_path():
                     continue
                 if path.exists():
                     try:
                         path.rmdir()
-                    except OSError:
-                        # 非空目录属于用户的后续数据，绝不递归清理。
-                        print('保留非空目录：' + str(path))
+                    except OSError as exc:
+                        if exc.errno in (errno.ENOTEMPTY, errno.EEXIST):
+                            raise UserError('保留非空目录，等待重试：' + str(path)) from exc
+                        raise
             elif kind == 'key':
                 if not confirm('删除本工具登记的钥匙串条目 ' + row['provider'] + '？', mode):
                     blocked = True
@@ -519,86 +593,122 @@ def uninstall(args):
             else:
                 raise UserError('未知安装动作，保留记录')
             record('undone', id=row['id'])
+            undone.add(row['id'])
         except (OSError, UserError) as exc:
             blocked = True
             print('❌ ' + str(exc))
     if dry:
         print('dry-run：配置、工作数据和钥匙串均保留；没有执行任何更改')
         return 0
-    if delete_config:
-        # 当前配置即使安装前已有、或安装后改过，也属于用户明确选择删除的工具文件。
-        try:
-            config_path().unlink(missing_ok=True)
-        except OSError as exc:
+    if delete_data and not blocked:
+        # 不跟随根目录或祖先的符号链接；系统根、HOME 和框架本身保守拒绝。
+        raw = Path(os.environ.get('FRCLYO_HOME', '~/AgentWork')).expanduser().absolute()
+        unsafe = (work in (Path('/'), HOME.resolve()) or work in HOME.resolve().parents or
+                  work == ROOT or raw != raw.resolve())
+        if unsafe:
+            print('❌ 根目录不适合递归删除，保留；请人工核对')
             blocked = True
-            print('❌ 配置删除失败：' + str(exc))
-    if delete_data:
-        # 数据删除只使用公共配置路径；危险根目录和符号链接一律拒绝。
-        unsafe = work in (Path('/'), HOME, STATE, ROOT) or work in ROOT.parents or work in HOME.parents
-        if work.is_symlink() or unsafe or not any(p.get('category') == 'data' and p.get('path') == str(work) for p in plans):
-            print('❌ 工作目录不是本次安装创建的独立目录，保留；请人工处理')
-            blocked = True
-        elif work.exists():
-            shutil.rmtree(work)
-            record('data-removed', path=str(work))
-    if delete_config and not blocked:
-        # 先完成所有撤销再删记录；失败时保留凭据，下一次可继续重试。
-        JOURNAL.unlink(missing_ok=True)
-        for row in reversed(plans):
-            if row.get('kind') == 'directory' and row.get('category') in ('config', 'data'):
-                path = Path(row['path'])
-                if path.exists() and (row.get('category') != 'data' or delete_data):
-                    with contextlib.suppress(OSError):
-                        path.rmdir()
-        with contextlib.suppress(OSError):
-            STATE.rmdir()
+        else:
+            try:
+                answer = input('永久删除本数据根索引中满足安全条件的根外私有临时目录（Codex .frclyo-work / OpenCode 回退目录），再删除根目录全部数据；根外清理不安全时保留根和索引。请先备份两处，并逐字输入完整路径 ' + str(work) + '：')
+            except EOFError:
+                answer = ''
+            if answer == str(work):
+                try:
+                    runtime('clean').uninstall_external(work)
+                except (OSError, ValueError, KeyError, TypeError) as exc:
+                    blocked = True
+                    print('❌ 根外清理未完成，保留根目录及索引：' + type(exc).__name__)
+                else:
+                    try:
+                        shutil.rmtree(work)
+                        print('已删除明确确认的根目录')
+                    except OSError as exc:
+                        blocked = True
+                        print('❌ 根目录部分数据未删除：' + str(exc.filename or work))
+            else:
+                print('完整路径未匹配，数据保留')
+    elif '--delete-data' in args:
+        print('本次未删除数据（预演、无输入或撤销未完成）')
     print('卸载步骤结束；' + ('有变更被保留，请核对上述说明' if blocked else '未选择删除的配置和数据已保留'))
     return 1 if blocked else 0
 
 
 def key_command(args):
-    """密钥内容只交给 keys.py；CLI 只接收提供方名字和操作结果。"""
+    """密钥内容由 security 隐藏输入；CLI 只接收提供方名字和操作结果。"""
     names = {'添加': 'add', '登记': 'add', '列表': 'list', '删除': 'remove', '移除': 'remove'}
     if not args:
-        raise UserError('用法：aw key add|list|remove <提供商>')
+        raise UsageError('用法：aw key add|remove <家>；aw key list')
     action = names.get(args[0], args[0])
     if action == 'list' and len(args) == 1:
-        print('\n'.join(runtime('keys').list_providers()) or '尚未登记 key')
+        keys = runtime('keys')
+        for provider in config()['providers']:
+            print(provider + '：' + keys.source_label(keys.key_source(provider)))
         return 0
     if action not in ('add', 'remove') or len(args) != 2:
-        raise UserError('用法：aw key add|list|remove <提供商>')
+        raise UsageError('用法：aw key add|remove <家>；aw key list')
     provider = args[1]
     if provider not in config()['providers']:
-        raise UserError('配置里没有这家提供商')
-    if action == 'add' and provider in runtime('keys').list_providers():
+        raise UsageError('配置里没有这家提供商')
+    source = runtime('keys').key_source(provider) if action == 'add' else None
+    if source and source['kind'] in ('keychain', 'unknown') and source['external']:
+        prefix = '无法确认外部钥匙串条目（钥匙串锁定或拒绝访问），拒绝写入；' if source['kind'] == 'unknown' else ''
+        raise UserError(prefix + '这家配置的是外部条目 %s（账户 %s），请在原来的工具里更新；'
+                        '如果想改由本框架管理，先从配置的 keychain_entries 里去掉这一项'
+                        % (source['service'], source['account']))
+    if source and source['kind'] == 'unknown':
+        raise UserError('无法确认默认钥匙串条目（钥匙串锁定或拒绝访问），拒绝写入；请解锁或允许访问后重试')
+    if source and source['kind'] == 'keychain':
+        rows = read_journal()
+        undone = {row.get('id') for row in rows if row['action'] == 'undone'}
+        registered = any(row['action'] == 'plan' and row.get('kind') == 'key'
+                         and row.get('provider') == provider and row.get('id') not in undone
+                         for row in rows)
+        if not registered:
+            raise UserError('这个条目不是本工具登记的，请用“钥匙串访问”或 security 命令手动处理')
         print('该家已有 key，保留现有凭据；需要更换请先 aw key remove ' + provider)
         return 0
     if action == 'add':
-        # set_key 自己询问一次；取消不创建记录，只有实际新增才纳入撤销。
-        try:
-            added = runtime('keys').set_key(provider)
-        except Exception as exc:
-            raise UserError('密钥登记失败；密钥内容不会输出') from exc
-        if not added:
+        if source['kind'] == 'env_file':
+            print('当前从回退文件读取；存入钥匙串后优先用钥匙串')
+        # 确认前不声明归属；EOF/Ctrl-C 或拒绝均不会留下安装计划。
+        if input('将向钥匙串新增 frclyo-%s，继续？[y/N] ' % provider).strip().lower() not in ('y', 'yes'):
             return 0
+        # 确认后、系统新增前持久化意图；调用开始后中断仍可按计划恢复。
+        journal_begin()
+        token = uuid.uuid4().hex
+        record('plan', id=token, kind='key', provider=provider,
+               state='in-progress', absent_before=True)
         try:
-            journal_begin()
-            token = uuid.uuid4().hex
-            record('plan', id=token, kind='key', provider=provider)
-            record('done', id=token)
-        except Exception:
-            remove_key(provider)
-            raise
+            # 与 keys.set_key 一样交由 security 提示密码，不读取、不传递密码值。
+            result = subprocess.run(['security', 'add-generic-password', '-s', 'frclyo-' + provider,
+                                     '-a', 'frclyo', '-w'], stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL)
+            if result.returncode:
+                raise RuntimeError('钥匙串写入失败')
+        except RuntimeError as exc:
+            # 系统命令明确报告新增失败，不冒领并发出现的同名条目。
+            record('undone', id=token)
+            raise UserError('密钥登记失败；密钥内容不会输出') from exc
+        except Exception as exc:
+            # 未知异常保留意图；不能假定系统命令尚未生效。
+            raise UserError('密钥登记结果未确认；已保留进行中记录') from exc
+        record('done', id=token)
         print('✅ 已登记 ' + provider)
     else:
-        if not confirm('从钥匙串删除 ' + provider + '？'):
+        rows = read_journal()
+        undone = {row.get('id') for row in rows if row['action'] == 'undone'}
+        registered = [row for row in rows if row['action'] == 'plan' and row.get('kind') == 'key'
+                      and row.get('provider') == provider and row.get('id') not in undone]
+        if not registered:
+            raise UserError('本工具未登记该家的默认条目；未删除任何条目')
+        if not confirm('从钥匙串删除本工具登记的默认条目 ' + provider + '？'):
             return 0
         removed = remove_key(provider)
         journal_begin()
         # 此条目的旧安装动作已撤销，避免未来卸载误删后来另行新增的条目。
-        for row in read_journal():
-            if row['action'] == 'plan' and row.get('kind') == 'key' and row.get('provider') == provider:
-                record('undone', id=row['id'])
+        for row in registered:
+            record('undone', id=row['id'])
         record('key-removed', provider=provider)
         print(('✅ 已删除 ' if removed else '钥匙串中不存在 ') + provider)
     return 0
@@ -811,6 +921,22 @@ def demo(args):
     performance_ready()
     parent = new_task('CSV 契约先行、两个工人并行演示', source='DM')
     children, jobs = [], []
+    accepted = False
+    recorded = set()
+    finished = set()
+
+    def record_results(passed, summary):
+        for job in jobs:
+            if 'rc' not in job:
+                continue
+            for attempt in [*job.get('attempts', []), job]:
+                identity = (attempt['task'], attempt['round'])
+                if identity not in recorded:
+                    ok = passed if attempt is job else False
+                    reason = summary if attempt is job else attempt['failure']
+                    save_performance(performance_row(attempt, ok, reason, 'demo'))
+                    recorded.add(identity)
+
     try:
         for label, choice in zip(('a', 'b'), choices):
             task = new_task('CSV 子任务 ' + label.upper(), parent, source='DM')
@@ -834,24 +960,22 @@ def demo(args):
             checks = path_of('work_dir') / 'demo-results' / parent
             checker().demo_gates(jobs[0]['directory'], jobs[1]['directory'], ROOT / 'demo', checks)
         summary = '三关通过：样例逐字节一致、双方测试复跑通过、端到端逐字节一致；证据=' + str(checks)
-        for job in jobs:
-            for attempt in job.get('attempts', []):
-                save_performance(performance_row(attempt, False, attempt['failure'], 'demo'))
-            save_performance(performance_row(job, True, summary, 'demo'))
-        finish_batch(parent, True, summary)
+        accepted = True
+        acceptance_summary = summary
+        record_results(True, summary)
         for task in children:
             finish_task(task, True, summary)
+            finished.add(task)
+        finish_batch(parent, True, summary)
         print('两位工人只按契约对接，CSV 清洗与分类统计已经接通。三关全部通过。\n父任务：' + parent + '\n证据：' + str(checks))
         return 0
     except BaseException as exc:
-        summary = '演示未通过：' + (str(exc) if isinstance(exc, (UserError, checker().CheckError)) else type(exc).__name__)
-        for job in jobs:
-            if 'rc' in job:
-                with contextlib.suppress(Exception):
-                    for attempt in job.get('attempts', []):
-                        save_performance(performance_row(attempt, False, attempt['failure'], 'demo'))
-                    save_performance(performance_row(job, False, summary, 'demo'))
+        summary = ('三关已通过，收尾记账失败：' if accepted else '演示未通过：') + (str(exc) if isinstance(exc, (UserError, checker().CheckError)) else type(exc).__name__)
+        with contextlib.suppress(Exception):
+            record_results(accepted, acceptance_summary if accepted else summary)
         for task in children + [parent]:
+            if task in finished:
+                continue
             with contextlib.suppress(UserError):
                 finish_task(task, False, summary)
         if isinstance(exc, KeyboardInterrupt):
@@ -862,15 +986,18 @@ def demo(args):
 def doctor(args):
     """默认自检只查询本机；live 在费用确认后复用独立小题验收。"""
     mode_flags(args, ('--live',))
+    if runtime('config').migration_needed():
+        print('⚠️ 正在读取旧位置 ~/.frclyo/config.json；请迁移到根目录 配置/config.json')
     failures = 0
     print(('✅ ' if platform.system() == 'Darwin' else '❌ ') + '系统：' + platform.system())
     print('✅ Python ' + platform.python_version())
-    tools_report()
+    available_tools = tools_report()
     try:
         current = config()
-        print('✅ 配置可读取' + ('（使用默认值）' if not config_path().exists() else ''))
-        providers = runtime('keys').list_providers()
-        print('✅ 已登记 key：' + ('、'.join(providers) if providers else '无'))
+        print('✅ 配置可读取' + ('（使用默认值）' if not runtime('config').config_file().exists() else ''))
+        keys = runtime('keys')
+        for provider in current['providers']:
+            print('key ' + provider + '：' + keys.source_label(keys.key_source(provider)))
         up = port_open(current['board_port'])
         print(('✅ ' if up else '⚠️ ') + '看板端口 ' + str(current['board_port']) + (' 正在监听' if up else ' 未监听；aw board start 可启动'))
     except (UserError, OSError):
@@ -880,6 +1007,7 @@ def doctor(args):
         pool = model_inventory()
         for choice in pool:
             print('候选组合：' + choice['worker'] + ' × ' + choice['model'] + '；可用性=' + choice.get('availability', 'unknown') + '；来源=' + choice.get('source', '发现接口'))
+        pool = [row for row in pool if row['worker'] in available_tools]
         if not pool:
             failures += 1
             print('❌ 无可用模型；请安装并登录 Codex，或为 OpenCode 登记 key')
@@ -916,82 +1044,107 @@ def calibrate(args, pool=None, live=False, fallback_pool=None):
     performance_ready()
     results, covered, outcomes = [], set(), []
     parent = new_task('真实工人自检' if live else '三题模型校准')
-    for choice in pool:
-        for question in questions:
-            if (choice['worker'], choice['model'], question['id']) in covered:
-                continue
-            # 前题或前一个组合已证明不可用时，不再为同一版本重复付费尝试。
-            if not runtime('models').rank([choice]):
-                break
-            task = new_task('校准 ' + question['id'] + ' ' + choice['model'])
-            ledger('备注', task, '校准批次=' + parent)
-            text = ('项目：frclyo-demo\n# 校准任务 ' + question['id'] + '\n' + question['spec'] +
-                    '\nT-code；C0；V1；L1；风险低；仅 Python 3.9 标准库，每段中文注释。'
-                    '\n只在本轮目录交付 solve.py，禁止修改输入材料，禁止联网，允许再拆 0 层。'
-                    '\n超时 240 秒。交付说明：结论、产物、自检、决策披露、状态。')
-            job = prepare_worker(task, choice, text, ROOT / 'demo/calibrate')
-            passed, note = False, '未执行'
-            try:
-                remaining = [row for row in fallback_pool if
-                             (row['worker'], row['model'], question['id']) not in covered]
-                invoke_with_fallback(job, remaining)
-                verify_receipt(job)
-                checker().grade(job['directory'], question)
-                passed, note = True, '固定评分用例全部通过'
-            except (UserError, OSError, checker().CheckError) as exc:
-                note = str(exc) if isinstance(exc, UserError) else '评分或执行失败：' + type(exc).__name__
-            finish_task(task, passed, note)
-            for attempt in job.get('attempts', []):
-                row = performance_row(attempt, False, attempt['failure'], 'doctor' if live else 'calibrate')
+    open_tasks = {parent}
+    try:
+        for choice in pool:
+            for question in questions:
+                if (choice['worker'], choice['model'], question['id']) in covered:
+                    continue
+                # 前题或前一个组合已证明不可用时，不再为同一版本重复付费尝试。
+                if not runtime('models').rank([choice]):
+                    break
+                task = new_task('校准 ' + question['id'] + ' ' + choice['model'])
+                open_tasks.add(task)
+                ledger('备注', task, '校准批次=' + parent)
+                text = ('项目：frclyo-demo\n# 校准任务 ' + question['id'] + '\n' + question['spec'] +
+                        '\nT-code；C0；V1；L1；风险低；仅 Python 3.9 标准库，每段中文注释。'
+                        '\n只在本轮目录交付 solve.py，禁止修改输入材料，禁止联网，允许再拆 0 层。'
+                        '\n超时 240 秒。交付说明：结论、产物、自检、决策披露、状态。')
+                job = prepare_worker(task, choice, text, ROOT / 'demo/calibrate')
+                passed, note = False, '未执行'
+                try:
+                    remaining = [row for row in fallback_pool if
+                                 (row['worker'], row['model'], question['id']) not in covered]
+                    invoke_with_fallback(job, remaining)
+                    verify_receipt(job)
+                    checker().grade(job['directory'], question)
+                    passed, note = True, '固定评分用例全部通过'
+                except (UserError, OSError, checker().CheckError) as exc:
+                    note = str(exc) if isinstance(exc, UserError) else '评分或执行失败：' + type(exc).__name__
+                finish_task(task, passed, note)
+                open_tasks.discard(task)
+                for attempt in job.get('attempts', []):
+                    row = performance_row(attempt, False, attempt['failure'], 'doctor' if live else 'calibrate')
+                    save_performance(row)
+                    results.append(row)
+                    covered.add((attempt['choice']['worker'], attempt['choice']['model'], question['id']))
+                row = performance_row(job, passed, note, 'doctor' if live else 'calibrate')
                 save_performance(row)
                 results.append(row)
-                covered.add((attempt['choice']['worker'], attempt['choice']['model'], question['id']))
-            row = performance_row(job, passed, note, 'doctor' if live else 'calibrate')
-            save_performance(row)
-            results.append(row)
-            outcomes.append(passed)
-            choice = job['choice']
-            covered.add((choice['worker'], choice['model'], question['id']))
-    report = ['# 本机路由建议', '', '仅来自本次小题测量；未知费用未估算成实测费用。可用性 ok 只代表工人完成，产物另行评分。',
-              '模型不支持才换候选，最多换 3 个；已不可用的组合停止后续题目，相同模型和题目不重复执行。', '',
-              '| 工人 × 模型 | 通过率 | 用时秒 | 费用 |', '|---|---:|---:|---|']
-    combinations = dict.fromkeys((r['工人'], r['模型']) for r in results)
-    for worker, model in combinations:
-        rows = [r for r in results if r['工人'] == worker and r['模型'] == model]
-        passed = sum(r['通过验收'] for r in rows)
-        seconds = sum(r['用时秒'] or 0 for r in rows)
-        cost = '订阅额度，金额未知' if worker == 'codex' else '未知（回执未提供金额）'
-        report.append('| %s × %s | %d/%d (%.0f%%) | %.3f | %s |' %
-                      (worker, model, passed, len(rows), passed / len(rows) * 100, seconds, cost))
-    failed = [row for row in results if not row['通过验收']]
-    exit_note = ('真实自检的退出码按各工人最终验收结果决定。' if live else
-                 '校准已完成出报告，退出码 0 不代表全部组合通过。')
-    report += ['', '失败轮次：' + str(len(failed)) + '（包括切换前的模型拒绝）；' + exit_note]
-    for row in failed:
-        report.append('- %s × %s：%s/%s；%s；证据=%s' %
-                      (row['工人'], row['模型'], row['任务号'], row['轮次'], row['备注'],
-                       path_of('deliver_dir') / row['任务号'] / row['轮次']))
-    report += ['', '建议：优先选择本次全部通过且用时较短的组合处理类似小任务；未全通过的组合先检查失败证据，复杂任务需另行验证。', '']
-    destination = path_of('work_dir') / ('自检报告.md' if live else '路由建议.md')
-    destination.write_text('\n'.join(report), encoding='utf-8')
-    all_ok = bool(outcomes) and (all(outcomes) if live else all(r['通过验收'] for r in results))
-    finish_batch(parent, all_ok, '评分完成；报告=' + str(destination))
-    print('报告：' + str(destination))
-    return (0 if outcomes and all(outcomes) else 1) if live else 0
+                outcomes.append(passed)
+                choice = job['choice']
+                covered.add((choice['worker'], choice['model'], question['id']))
+        report = ['# 本机路由建议', '', '仅来自本次小题测量；未知费用未估算成实测费用。可用性 ok 只代表工人完成，产物另行评分。',
+                  '模型不支持才换候选，最多换 3 个；已不可用的组合停止后续题目，相同模型和题目不重复执行。', '',
+                  '| 工人 × 模型 | 通过率 | 用时秒 | 费用 |', '|---|---:|---:|---|']
+        combinations = dict.fromkeys((r['工人'], r['模型']) for r in results)
+        for worker, model in combinations:
+            rows = [r for r in results if r['工人'] == worker and r['模型'] == model]
+            passed = sum(r['通过验收'] for r in rows)
+            seconds = sum(r['用时秒'] or 0 for r in rows)
+            cost = '订阅额度，金额未知' if worker == 'codex' else '未知（回执未提供金额）'
+            report.append('| %s × %s | %d/%d (%.0f%%) | %.3f | %s |' %
+                          (worker, model, passed, len(rows), passed / len(rows) * 100, seconds, cost))
+        failed = [row for row in results if not row['通过验收']]
+        exit_note = ('真实自检的退出码按各工人最终验收结果决定。' if live else
+                     '校准已完成出报告，退出码 0 不代表全部组合通过。')
+        report += ['', '失败轮次：' + str(len(failed)) + '（包括切换前的模型拒绝）；' + exit_note]
+        for row in failed:
+            report.append('- %s × %s：%s/%s；%s；证据=%s' %
+                          (row['工人'], row['模型'], row['任务号'], row['轮次'], row['备注'],
+                           path_of('deliver_dir') / row['任务号'] / row['轮次']))
+        report += ['', '建议：优先选择本次全部通过且用时较短的组合处理类似小任务；未全通过的组合先检查失败证据，复杂任务需另行验证。', '']
+        destination = path_of('work_dir') / ('自检报告.md' if live else '路由建议.md')
+        destination.write_text('\n'.join(report), encoding='utf-8')
+        all_ok = bool(outcomes) and (all(outcomes) if live else all(r['通过验收'] for r in results))
+        finish_batch(parent, all_ok, '评分完成；报告=' + str(destination))
+        open_tasks.discard(parent)
+        print('报告：' + str(destination))
+        return (0 if outcomes and all(outcomes) else 1) if live else 0
+    except KeyboardInterrupt:
+        # 先回收进程，再逐卡记中断；某张卡写入失败也继续处理其余卡。
+        cancel_workers()
+        for opened in sorted(open_tasks):
+            try:
+                finish_task(opened, False, '用户中断')
+            except Exception as exc:
+                print('❌ 中断状态写入失败：' + opened + '（' + type(exc).__name__ + '）', file=sys.stderr)
+        raise
+
 
 
 HELP = '''aw：本机多工人入口（中文/英文命令均可）
-  aw key add|list|remove <家>     钥匙串登记、只列名字、删除
+  aw key add|remove <家>          钥匙串登记或删除已登记条目
+  aw key list                     列出各家的凭据来源
   aw board [start|stop|open|status] 前台启动、停自启、打开、状态
   aw ledger …                   原样传给账本
+  aw card new <模板> <任务号> [--title …] [--round r1]  新建任务卡（中文：卡 新建、--标题、--轮）
+  aw changelog append --change "…" --undo "…"  加锁分配台账编号
+  aw 台账 追加 --改动 "…" --撤销 "…"            同上
+  aw clean [--days N] [--yes]    清理收卡超过 N 天的私有目录；默认列出，删除另需确认
+  aw merge <任务> <轮> --到 <开发版目录> [--基准 <目录>] [--试跑]  三方合并（中文：合并）
+  aw repro <任务> <轮> [--测试 名字] [--框架 输入|交付|路径] [--不套沙箱]  复现交付测试（中文：复现；英文选项：--test、--framework、--no-sandbox）
   aw run codex|opencode …        原样传给执行脚本
+  aw dispatch 队列.json [--并行 N] [--额度上限 P] [--试跑]  一次派一批（中文：派活）
+  aw release [--paid|--migrate|--undo-migration] / rollback [版本] / versions（发布 / 回滚 / 版本）
+  aw verify [--paid]            宿主统一验收（中文：验收）；默认不调用真实模型
   aw doctor [--live]             本机自检；live 确认费用后跑小题
   aw demo                       契约 → 两个工人并行 → 三关验收
   aw calibrate                  确认组合和费用后跑三题，生成路由建议
-  aw uninstall [--dry-run]       按安装记录撤销，默认保留配置和数据
+  aw uninstall [--dry-run] [--delete-data]  默认保留数据；删除另需完整路径确认
   aw help                       本说明
 中文：密钥（添加/列表/删除）、看板（启动/停止/打开/状态）、账本、运行、自检、演示、校准、卸载、帮助
-安装/演示/校准支持 --yes、--no-input；卸载 --yes 也会同意删除数据，使用前请先 --dry-run。
+安装/演示/校准支持 --yes、--no-input；卸载 --yes 只确认撤销安装（含本工具登记的钥匙串条目），删除数据须另加 --delete-data 并逐字输入完整路径，使用前请先 --dry-run。
 '''
 
 
@@ -1000,18 +1153,48 @@ def main(args=None):
     if sys.version_info < (3, 9):
         raise UserError('需要 Python 3.9 或以上版本')
     args = list(sys.argv[1:] if args is None else args)
-    aliases = {'密钥': 'key', '钥匙': 'key', '看板': 'board', '账本': 'ledger', '运行': 'run',
-               '自检': 'doctor', '演示': 'demo', '校准': 'calibrate', '卸载': 'uninstall', '帮助': 'help'}
+    aliases = {'密钥': 'key', '钥匙': 'key', '看板': 'board', '账本': 'ledger', '台账': 'changelog', '运行': 'run',
+               '派活': 'dispatch',
+               '卡': 'card',
+               '清理': 'clean', '验收': 'verify', '自检': 'doctor', '演示': 'demo', '校准': 'calibrate', '卸载': 'uninstall', '帮助': 'help'}
+    aliases['合并'] = 'merge'  # 中文入口复用同一合并实现。
+    aliases['复现'] = 'repro'
+    aliases.update({'发布': 'release', '回滚': 'rollback', '版本': 'versions'})
     command = aliases.get(args[0], args[0]) if args else 'help'
     rest = args[1:]
     if command in ('help', '--help', '-h'):
         print(HELP)
         return 0
+    help_text = {
+        'key': 'aw key add|remove <家>；aw key list（中文：密钥、钥匙）',
+        'board': 'aw board [start|stop|open|status]（中文：看板）',
+        'run': 'aw run codex|opencode <任务号> <轮次> <任务卡> <模型> <档位> [超时]',
+        'doctor': 'aw doctor [--live] [--yes|--no-input]；live 确认费用后执行真实自检',
+        'demo': 'aw demo [--yes|--no-input]；确认费用后运行并行演示',
+        'calibrate': 'aw calibrate [--yes|--no-input]；确认费用后运行三题校准',
+        'uninstall': 'aw uninstall [--dry-run] [--delete-data] [--yes|--no-input]；默认保留数据',
+        '__install': 'aw __install [--yes|--no-input]',
+        '__uninstall': 'aw __uninstall [--dry-run] [--delete-data] [--yes|--no-input]',
+    }
+    if rest in (['--help'], ['-h']) and command in help_text:
+        print('用法：' + help_text[command])
+        return 0
+    if command in ('release', 'rollback', 'versions'): return runtime('release').main([command, *rest])
+    if command == 'verify':
+        os.execv(sys.executable, [sys.executable, '-B', str(ROOT / 'tests/host/verify_all.py'), *rest])
+    if command == 'repro': return runtime('repro').main(rest)
+    if command == 'clean':
+        return runtime('clean').main(rest)
+    if command == 'merge': return runtime('merge').main(rest)  # 延迟加载，不影响其他命令。
+    if command == 'dispatch': return runtime('dispatch').main(rest)
+    if command == 'card': return runtime('cards').main(rest)
+    if command == 'changelog':
+        return runtime('changelog').main(rest)
     if command == 'ledger':
-        os.execv(str(ROOT / 'bin/ledger'), [str(ROOT / 'bin/ledger'), *rest])
+        return runtime('ledger').main(rest, prog='aw ' + args[0])
     if command == 'run':
         if not rest or rest[0] not in ('codex', 'opencode'):
-            raise UserError('用法：aw run codex|opencode <任务号> <轮次> <任务卡> <模型> <档位> [超时]')
+            raise UsageError('用法：aw run codex|opencode <任务号> <轮次> <任务卡> <模型> <档位> [超时]')
         script = ROOT / 'bin' / (rest[0] + '-worker.sh')
         os.execv(str(script), [str(script), *rest[1:]])
     if command == 'uninstall':
@@ -1019,7 +1202,8 @@ def main(args=None):
     actions = {'__install': install, '__uninstall': uninstall, 'key': key_command,
                'board': board, 'doctor': doctor, 'demo': demo, 'calibrate': calibrate}
     if command not in actions:
-        raise UserError('未知命令；请运行 aw help')
+        raise UsageError('未知命令；请运行 aw help')
+    # 参数检查由命令负责；所有路径校验都在顶层异常处理以内。
     return actions[command](rest)
 
 
@@ -1027,12 +1211,15 @@ if __name__ == '__main__':
     # 不打印未知异常的原文，避免配置或钥匙串异常带出敏感内容。
     try:
         sys.exit(main())
-    except UserError as error:
+    except UsageError as error:
         print('❌ ' + str(error), file=sys.stderr)
         sys.exit(2)
+    except UserError as error:
+        print('❌ ' + str(error), file=sys.stderr)
+        sys.exit(1)
     except KeyboardInterrupt:
         print('已中断', file=sys.stderr)
-        sys.exit(130)
+        sys.exit(1)
     except Exception as error:
-        print('❌ 操作失败（' + type(error).__name__ + '）；请检查文件权限和运行时接口', file=sys.stderr)
-        sys.exit(2)
+        print('❌ 操作失败（' + type(error).__name__ + '）；请检查 FRCLYO_HOME 数据根、文件权限和运行时接口', file=sys.stderr)
+        sys.exit(1)

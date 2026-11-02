@@ -106,7 +106,7 @@ class LedgerLock:
         except FileNotFoundError:
             return False
 
-    def append(self, events):
+    def append(self, events, *, separate_tail=False):
         """先序列化全部事件，再持锁追加并 fsync；永远不覆盖原有字节。"""
         data = "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in events).encode("utf-8")
         if not data:
@@ -115,8 +115,15 @@ class LedgerLock:
             if not self.owns() or time.time() - self.directory.stat().st_mtime > 30:
                 raise LedgerError("账本锁已过期，本次没有追加；请重试")
             # O_APPEND 保证追加位置；处理短写，断电造成的坏尾行由读取校验明确报出。
-            fd = os.open(str(self.path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            mode = os.O_RDWR if separate_tail else os.O_WRONLY
+            fd = os.open(str(self.path), mode | os.O_CREAT | os.O_APPEND, 0o600)
             try:
+                # 表现记录允许保留坏行继续写；检查与补 LF 都在同一追加锁内。
+                # 账本仍由 read_events 严格校验，不自动修补其尾行。
+                if separate_tail and os.fstat(fd).st_size:
+                    os.lseek(fd, -1, os.SEEK_END)
+                    if os.read(fd, 1) != b"\n":
+                        data = b"\n" + data
                 view = memoryview(data)
                 while view:
                     written = os.write(fd, view)
@@ -137,11 +144,14 @@ def read_events(path):
     """严格读取账本，坏行报出行号；共享锁避免读到正在追加的一半。"""
     with guard(path):
         try:
-            data = Path(path).read_text(encoding="utf-8")
+            data = Path(path).read_bytes().decode("utf-8")
         except FileNotFoundError:
             return []
         events = []
-        for number, line in enumerate(data.splitlines(), 1):
+        lines = data.split("\n")
+        if lines[-1] == "":
+            lines.pop()
+        for number, line in enumerate(lines, 1):
             try:
                 e = json.loads(line)
                 if not isinstance(e, dict) or e.get("动作") not in ACTIONS:
@@ -164,6 +174,75 @@ def read_events(path):
         return events
 
 
+def receipt_exception_path(path):
+    """独立文件不引入账本事件，旧版本回滚时可直接忽略。"""
+    return Path(path).parent / "回执例外.jsonl"
+
+
+def read_receipt_exceptions(path):
+    """共享账本读锁；逐行校验，坏行仅提醒，不丢弃其他有效记录。"""
+    sidecar = receipt_exception_path(path)
+    records, invalid = [], []
+    with guard(sidecar):
+        try:
+            data = sidecar.read_bytes()
+        except FileNotFoundError:
+            return records, []
+        lines = data.split(b"\n")
+        if lines[-1] == b"":
+            lines.pop()
+        for number, line in enumerate(lines, 1):
+            try:
+                row = json.loads(line.decode("utf-8"))
+                if not isinstance(row, dict):
+                    raise ValueError("记录不是对象")
+                for field in ("时间", "任务", "原因"):
+                    if not isinstance(row.get(field), str) or not row[field].strip():
+                        raise ValueError("字段为空或不是文字")
+                if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", row["时间"]):
+                    raise ValueError("时间格式无效")
+                datetime.strptime(row["时间"], "%Y-%m-%dT%H:%M:%SZ")
+                if "轮次清单" in row and (not isinstance(row["轮次清单"], list)
+                        or any(not isinstance(name, str)
+                               or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_-]*", name)
+                               for name in row["轮次清单"])):
+                    raise ValueError("轮次清单无效")
+            except (ValueError, TypeError, UnicodeError, RecursionError):
+                invalid.append(str(number))
+                continue
+            records.append({"时间": row["时间"], "任务": row["任务"],
+                            "原因": row["原因"].strip(), "来源": sidecar.name,
+                            **({"轮次清单": row["轮次清单"]} if "轮次清单" in row else {})})
+    warnings = (["⚠️ 回执例外.jsonl 第 %s 行无效，已跳过" % "、".join(invalid)]
+                if invalid else [])
+    return records, warnings
+
+
+def receipt_exceptions(card, records=()):
+    """合并两种来源的有效原因，按时间排序；同秒按来源内顺序，旁文件优先。"""
+    combined = []
+    for e in card["事件"]:
+        if e["动作"] == "备注" and e["内容"].startswith("回执例外："):
+            reason = e["内容"][len("回执例外："):].strip()
+            if reason:
+                combined.append({"时间": e["时间"], "任务": e["任务"],
+                                 "原因": reason, "来源": "账本备注",
+                                 **({"轮次清单": e["轮次清单"]} if "轮次清单" in e else {})})
+    combined.extend(row for row in records if row["任务"] == card["任务"])
+    return sorted(combined, key=lambda row: datetime.strptime(row["时间"], "%Y-%m-%dT%H:%M:%SZ"))
+
+
+def append_receipt_exception(path, task, reason):
+    """用同目录账本事务锁核对任务，再用既有追加/fsync 协议写独立文件。"""
+    if not isinstance(reason, str) or not reason.strip():
+        raise LedgerError("回执例外原因不能为空")
+    with LedgerLock(receipt_exception_path(path)) as lock:
+        require_card(fold(read_events(path)), task)
+        rounds = [name for name in delivery_rounds(Paths().deliver, task) if not name.startswith("-")]
+        lock.append([{"时间": utc(), "任务": task, "原因": reason.strip(),
+                      "轮次清单": rounds}], separate_tail=True)
+
+
 def fold(events):
     """按追加顺序重放；备注不改变状态，恢复回到开卡状态。"""
     cards = {}
@@ -173,13 +252,22 @@ def fold(events):
             if task in cards:
                 raise LedgerError("账本第 %d 行重复开卡：%s" % (number, task))
             cards[task] = dict(e, 状态="开卡", 事件=[], 原因="", 结论="", 摘要="")
+            card = cards[task].get("卡片文件")
+            if isinstance(card, str) and card.startswith("runs/"):
+                relative = Path(card[5:])
+                if relative.is_absolute() or ".." in relative.parts:
+                    raise LedgerError("旧卡片路径含越界片段")
+                cards[task]["卡片文件"] = str(Path(config.path_of("cards_dir")) / relative)
         elif task not in cards:
             raise LedgerError("账本第 %d 行任务未开卡：%s" % (number, task))
         c = cards[task]
         if action != "开卡":
-            if c["状态"] in TERMINAL:
+            reopening = (action == "恢复" and c["状态"] in TERMINAL and
+                         isinstance(e.get("轮次"), str) and
+                         re.fullmatch(r"[A-Za-z0-9_-]+", e["轮次"]))
+            if c["状态"] in TERMINAL and not reopening:
                 raise LedgerError("账本第 %d 行操作了已结束的卡：%s" % (number, task))
-            if action == "恢复" and c["状态"] != "卡住":
+            if action == "恢复" and c["状态"] != "卡住" and not reopening:
                 raise LedgerError("账本第 %d 行恢复了未卡住的卡" % number)
             if action == "卡住" and c["状态"] == "卡住":
                 raise LedgerError("账本第 %d 行重复卡住" % number)
@@ -249,6 +337,32 @@ def round_numbers(deliver, task):
         return []
 
 
+def delivery_rounds(deliver, task):
+    """日审轮次：保留数字目录规则，命名目录须有回执或运行信息。"""
+    numeric = [name for _, name in round_numbers(deliver, task)]
+    directory = Path(deliver) / task
+    try:
+        named = sorted(p.name for p in directory.iterdir()
+                       if re.fullmatch(r"[A-Za-z0-9_-]+", p.name)
+                       and not re.fullmatch(r"r[0-9]+", p.name) and p.is_dir()
+                       and any(os.path.lexists(p / marker)
+                               for marker in ("回执.json", "运行信息.json")))
+    except FileNotFoundError:
+        named = []
+    return numeric + named
+
+
+def occupied_round_numbers(deliver, task):
+    """分配时统计所有占名节点，包含普通文件和断链；不改变日审目录语义。"""
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", task):
+        raise LedgerError("任务号不合法")
+    try:
+        return [int(p.name[1:]) for p in (Path(deliver) / task).iterdir()
+                if re.fullmatch(r"r[0-9]+", p.name)]
+    except FileNotFoundError:
+        return []
+
+
 def require_card(cards, task, active=False):
     """所有写操作只面向账本已开卡任务；读取命令仍能查询已结束卡。"""
     if task not in cards:
@@ -257,6 +371,29 @@ def require_card(cards, task, active=False):
     if active and card["状态"] in TERMINAL:
         raise LedgerError("任务已完成或放弃，不能再操作：" + task)
     return card
+
+
+def claim_round(run):
+    """宿主占用新轮时恢复已收卡任务；下一轮查询仍只读，不预先恢复。
+
+    目录占用和账本写入共用账本锁。恢复先于建目录：中断最多留下待处理卡，
+    不会留下已沿用旧验收的新轮。已有轮次在写账本之前拒绝。
+    未登记的测试任务不凭空开卡。
+    """
+    from .isolation import validate_run
+    paths = Paths()
+    run = Path(run)
+    validate_run(config.root_dir(), run)
+    task, round_id = run.parts[-2:]
+    with LedgerLock(paths.ledger) as lock:
+        cards = fold(read_events(paths.ledger))
+        if os.path.lexists(run):
+            raise FileExistsError(str(run))
+        card = cards.get(task)
+        if card and card["状态"] in TERMINAL:
+            lock.append([event("恢复", task, 轮次=round_id, 原因="派发新轮，清除旧轮验收")])
+        run.parent.mkdir(parents=True, exist_ok=True)
+        run.mkdir()
 
 
 def audit(paths):
@@ -272,13 +409,13 @@ def nonempty(value):
     return value
 
 
-def parser():
+def parser(prog="aw ledger"):
     """中文命令和英文别名共用参数定义，避免两套行为分叉。"""
-    p = argparse.ArgumentParser(description="本地任务账本（只追加）")
+    p = argparse.ArgumentParser(prog=prog, description="本地任务账本（只追加）")
     sub = p.add_subparsers(dest="command", required=True)
     definitions = [("开卡", "new"), ("卡住", "block"), ("恢复", "unblock"), ("完成", "done"),
                    ("放弃", "drop"), ("备注", "note"), ("查", "show"), ("列表", "list"),
-                   ("下一轮", "next-round")]
+                   ("下一轮", "next-round"), ("回执例外", "receipt-exception")]
     for chinese, english in definitions:
         s = sub.add_parser(chinese, aliases=[english])
         s.set_defaults(action=chinese)
@@ -292,20 +429,29 @@ def parser():
             s.add_argument("--在途", action="store_true")
         else:
             s.add_argument("任务", type=nonempty)
-            if chinese in ("卡住", "放弃", "备注"):
+            if chinese in ("卡住", "放弃", "备注", "回执例外"):
                 s.add_argument("文字", type=nonempty)
             if chinese == "完成":
                 s.add_argument("--结论", required=True, choices=["通过", "未通过"])
                 s.add_argument("--摘要", default="")
+                s.add_argument("--回执例外", "--receipt-exception", dest="回执例外", type=nonempty)
     return p
 
 
-def main(argv=None):
+def main(argv=None, prog="aw ledger"):
     """开卡 stdout 严格只输出任务号；诊断全部走 stderr。"""
-    args = parser().parse_args(argv)
+    command_parser = parser(prog)
+    args = command_parser.parse_args(argv)
+    if args.action == "开卡":
+        source = args.来源 if args.来源 is not None else os.environ.get("AGENT_BRAIN")
+        if not isinstance(source, str) or not re.fullmatch(r"[A-Z]{2}", source):
+            command_parser.error("请指定两个大写字母的来源（--来源 或 AGENT_BRAIN）")
     try:
         paths = Paths()
         action = args.action
+        if action == "回执例外":
+            append_receipt_exception(paths.ledger, args.任务, args.文字)
+            return 0
         # 只读命令不创建锁或账本；轮次只是查询建议值，不预留目录。
         if action in ("查", "列表", "下一轮"):
             events = read_events(paths.ledger)
@@ -313,21 +459,26 @@ def main(argv=None):
             if action == "下一轮":
                 if args.任务 not in used_ids(paths, events):
                     raise LedgerError("任务不存在：" + args.任务)
-                rounds = round_numbers(paths.deliver, args.任务)
-                print("r%d" % (max((n for n, _ in rounds), default=0) + 1))
+                rounds = occupied_round_numbers(paths.deliver, args.任务)
+                print("r%d" % (max(rounds, default=0) + 1))
             elif action == "查":
                 card = require_card(cards, args.任务)
                 print("%s  %s  [%s]  派活人：%s" % (args.任务, card["标题"], card["状态"], card["派活人"] or "未记录"))
                 print("项目：%s  来源：%s  父任务：%s" % (card["项目"], card["来源"], card["父任务"] or "无"))
                 # 人读历史先看动作和关键信息；完整原始迁移快照仍保留在账本及看板抽屉。
                 for e in card["事件"]:
-                    keys = {"开卡": ("标题", "卡片文件"), "卡住": ("原因",), "恢复": (),
+                    keys = {"开卡": ("标题", "卡片文件"), "卡住": ("原因",), "恢复": ("轮次", "原因"),
                             "完成": ("结论", "摘要"), "放弃": ("原因",), "备注": ("内容",)}[e["动作"]]
                     details = "；".join("%s：%s" % (k, e[k]) for k in keys if e.get(k))
                     print("%s  %s%s" % (e["时间"], e["动作"], "  " + details if details else ""))
+                exceptions, warnings = read_receipt_exceptions(paths.ledger)
+                for row in receipt_exceptions(card, exceptions):
+                    print("%s  回执例外（来源：%s）：%s" % (row["时间"], row["来源"], row["原因"]))
+                for warning in warnings:
+                    print(warning, file=sys.stderr)
             else:
                 print("任务号\t项目\t状态\t标题\t派活人\t原因/摘要")
-                for key, card in sorted(cards.items()):
+                for key, card in sorted(cards.items(), key=lambda kv: kv[1]["时间"]):
                     if args.项目 is not None and card["项目"] != args.项目:
                         continue
                     if args.在途 and card["状态"] in TERMINAL:
@@ -360,7 +511,14 @@ def main(argv=None):
                     fields["内容"] = args.文字
                 elif action == "完成":
                     fields.update(结论=args.结论, 摘要=args.摘要)
-                lock.append([event(action, args.任务, **fields)])
+                pending = []
+                if action == "完成" and args.回执例外 is not None:
+                    rounds = [name for name in delivery_rounds(paths.deliver, args.任务)
+                              if not name.startswith("-")]
+                    pending.append(event("备注", args.任务, 内容="回执例外：" + args.回执例外,
+                                         轮次清单=rounds))
+                pending.append(event(action, args.任务, **fields))
+                lock.append(pending)
         return 0
     except (LedgerError, OSError, UnicodeError, ValueError) as exc:
         print("错误：%s" % exc, file=sys.stderr)

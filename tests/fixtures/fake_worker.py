@@ -11,7 +11,8 @@ import time
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'bin'))
-from frclyo import config
+from frclyo import config, models
+from frclyo.execution import capture_directory, exclusive_directory
 
 # 独立写各自轮次，材料注入与真实工人一致。
 task, round_id, card, model, level, timeout = sys.argv[1:]
@@ -22,12 +23,19 @@ shutil.copytree(os.environ['WORKER_INPUT_DIR'], directory / '输入')
 text = Path(card).read_text(encoding='utf-8')
 # 通用模型拒绝注入：每个失败仍有独立事件与回执，CLI 版本由测试命令控制。
 worker = 'opencode' if Path(__file__).name.startswith('opencode') else 'codex'
+# 本文件替代的是宿主执行脚本，须同时模拟宿主私有观察，不让 aw 再读工人事件。
+private = capture_directory(worker, directory)
+exclusive_directory(private)
+version = models.cli_version(worker)
 if model in os.environ.get('FAKE_UNUSABLE', '').split(','):
     message = json.dumps({'status': 400, 'error': {'message':
                          "The '%s' model is not supported when using this CLI with this account." % model}})
     (directory / 'events.jsonl').write_text(json.dumps({'type': 'turn.failed', 'error': {'message': message}}) + '\n')
     (directory / '回执.json').write_text(json.dumps({'工人': worker, '模型': model,
         '任务编号': task, '轮次编号': round_id, '退出码': 1, '状态': '失败', '结果sha256': None}))
+    captured = (directory / 'events.jsonl').read_bytes()  # 此处是测试宿主生成的固定事件
+    (private / 'events.jsonl').write_bytes(captured)
+    models.observe(worker, model, version, directory, captured=captured)
     sys.exit(1)
 # 校准使用测试专属参考实现，生产派活材料不包含答案。
 if '# 校准任务 ' in text:
@@ -80,4 +88,5 @@ if bad == 'receipt':
     receipt['结果sha256'] = 'broken'
 if bad != 'missing-receipt':
     (directory / '回执.json').write_text(json.dumps(receipt, ensure_ascii=False), encoding='utf-8')
+models.observe(worker, model, version, directory, succeeded=bad not in ('exit', 'receipt', 'missing-receipt'), captured=b'')
 sys.exit(1 if bad == 'exit' else 0)

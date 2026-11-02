@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import shlex
 import sys
 import tempfile
 import time
@@ -25,17 +26,76 @@ class LedgerTest(unittest.TestCase):
         """隔离环境、路径和本地日期，让每个测试可单独复跑。"""
         self.tmp = tempfile.TemporaryDirectory(prefix="ledger-test-", dir=str(HERE))
         self.addCleanup(self.tmp.cleanup)
-        self.base = Path(self.tmp.name)
+        self.base = Path(self.tmp.name).resolve()
         self.book = self.base / "账本.jsonl"
-        self.runs, self.deliver = self.base / "runs", self.base / "交付"
+        self.runs, self.deliver = self.base / "任务卡", self.base / "交付"
         self.runs.mkdir()
         self.deliver.mkdir()
         cfg = self.base / "config.json"
-        cfg.write_text(json.dumps({"work_dir": str(self.base), "cards_dir": str(self.runs)}))
-        self.env = dict(os.environ, FRCLYO_CONFIG=str(cfg))
+        cfg.write_text(json.dumps({}))
+        self.env = dict(os.environ, FRCLYO_HOME=str(self.base), FRCLYO_CONFIG=str(cfg))
         self.env.pop("AGENT_BRAIN", None)
-        self.prefix = "CL-" + datetime.now().strftime("%Y%m%d") + "-"
+        # 真实 shell/进程/锁不替换；只给子解释器的账本时钟固定日期。
+        # 单独的 test_cli_uses_real_local_calendar_day 保留真实日期契约检查。
+        self.original_path = self.env.get('PATH', '')
+        commands = self.base / 'clock-bin'; commands.mkdir()
+        clock = ("import sys; sys.path.insert(0, sys.argv[1]); import frclyo.ledger as _ledger\n"
+                 "from datetime import datetime as _DateTime\n"
+                 "class _FixtureDateTime(_DateTime):\n"
+                 " @classmethod\n"
+                 " def now(cls, tz=None): return cls(2001, 2, 3)\n"
+                 "_ledger.datetime = _FixtureDateTime\n")
+        interpreter = commands / 'python3'
+        interpreter.write_text('#!/bin/sh\n' +
+            'if [ "$1" = "-I" ] && [ "$2" = "-c" ]; then\n' +
+            '  case "$3" in *"from frclyo.ledger import main"*)\n' +
+            '    code=$3; shift 3\n' +
+            '    exec ' + shlex.quote(sys.executable) + ' -I -c ' + shlex.quote(clock) + '"$code" "$@"\n' +
+            '  esac\nfi\nexec ' + shlex.quote(sys.executable) + ' "$@"\n')
+        interpreter.chmod(0o700)
+        self.env['PATH'] = str(commands) + os.pathsep + self.original_path
+        self.prefix = "CL-20010203-"
         self.new_args = ["new", "--项目", "测试项目", "--标题", "测试标题", "--来源", "CL"]
+
+    def test_cli_uses_real_local_calendar_day(self):
+        # 真实日期前后各取一次，跨午夜时允许真实命令使用任一天。
+        before = datetime.now().strftime('%Y%m%d')
+        result = self.cli(*self.new_args, env=dict(self.env, PATH=self.original_path))
+        after = datetime.now().strftime('%Y%m%d')
+        self.assertIn(result.stdout.strip(), {'CL-' + day + '-01' for day in (before, after)})
+    def test_source_usage_and_real_program_name(self):
+        for extra in ([], ['--来源', 'cx'], ['--来源', '中文']):
+            result = self.cli('new', '--项目', 'fixture', '--标题', 'fixture', *extra, ok=False)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn('指定两个大写字母的来源', result.stderr)
+            self.assertFalse(self.book.exists())
+            self.assertFalse((self.base / '.账本.guard').exists())
+        for args in (['--help'], ['new', '--help']):
+            result = self.cli(*args)
+            self.assertIn('aw ledger', result.stdout)
+            self.assertNotIn('usage: -c', result.stdout)
+
+
+    def test_unicode_jsonl_roundtrip(self):
+        for separator in ('\u2028', '\u2029', '\x85'):
+            e = ledger.event('开卡', self.prefix + '01', 标题='fixture', 项目='fixture',
+                             来源='CL', 派活人='fixture', 父任务='', 卡片文件='材料' + separator + '说明.txt')
+            with ledger.LedgerLock(self.book) as lock:
+                lock.append([e])
+            before = self.book.read_bytes()
+            self.assertEqual(ledger.read_events(self.book)[-1], e)
+            self.assertEqual(self.book.read_bytes(), before)
+
+    def test_next_round_skips_files_and_dangling_links(self):
+        key = self.new()
+        directory = self.deliver / key
+        (directory / 'r1').mkdir(parents=True)
+        (directory / 'r2').write_text('保留')
+        (directory / 'r3').symlink_to(directory / '不存在')
+        self.assertEqual(self.cli('下一轮', key).stdout.strip(), 'r4')
+        self.assertEqual(ledger.round_numbers(self.deliver, key), [(1, 'r1')])
+        self.assertEqual((directory / 'r2').read_text(), '保留')
+        self.assertTrue((directory / 'r3').is_symlink())
 
     def cli(self, *args, ok=True, env=None):
         """走可执行 shell 入口，连参数转发和退出码一起检查。"""
@@ -68,7 +128,7 @@ class LedgerTest(unittest.TestCase):
         data = "真实结果\n".encode()
         (d / "结果.txt").write_bytes(data)
         if receipt:
-            r = {"状态": status, "结果sha256": hashlib.sha256(data).hexdigest() if digest else "错误"}
+            r = {"任务编号": key, "轮次编号": rnd, "状态": status, "结果sha256": hashlib.sha256(data).hexdigest() if digest else "错误"}
             (d / "回执.json").write_text(json.dumps(r), encoding="utf-8")
         return d
 
@@ -129,7 +189,7 @@ class LedgerTest(unittest.TestCase):
         self.assertEqual(self.new(), self.prefix + "09")
         (self.deliver / (self.prefix + "20-A1")).mkdir()
         self.assertEqual(self.new(), self.prefix + "21")
-        (self.runs / ("CX-" + datetime.now().strftime("%Y%m%d") + "-99-r1.txt")).touch()
+        (self.runs / (self.prefix.replace("CL-", "CX-", 1) + "99-r1.txt")).touch()
         self.assertEqual(self.new(), self.prefix + "22")
 
     def test_hierarchy_external_sources(self):
@@ -143,14 +203,14 @@ class LedgerTest(unittest.TestCase):
         self.assertEqual(self.new("--父", parent + "-C"), parent + "-C10")
 
     def test_next_round_numeric_and_read_only(self):
-        """r10 大于 r9；同名普通文件和无关目录不算轮次。"""
+        """r10 大于 r9；普通文件也占用编号，无关目录不算轮次。"""
         key = self.new()
         self.assertEqual(self.cli("下一轮", key).stdout, "r1\n")
         for rnd in ("r1", "r9", "r10", "rubbish"):
             (self.deliver / key / rnd).mkdir(parents=True)
         (self.deliver / key / "r99").touch()
         before = self.book.read_bytes()
-        self.assertEqual(self.cli("next-round", key).stdout, "r11\n")
+        self.assertEqual(self.cli("next-round", key).stdout, "r100\n")
         self.assertEqual(self.book.read_bytes(), before)
         self.assertFalse((self.deliver / key / "r11").exists())
 
@@ -274,6 +334,21 @@ class LedgerTest(unittest.TestCase):
             self.assertEqual(proc.returncode, expected, proc.stderr)
             self.assertEqual(len(json.loads(proc.stdout)["问题"]), expected)
             self.evidence(key, "r1")
+
+    def test_list_sorted_by_time_not_file_order(self):
+        """列表按每张卡的时间排序，与账本追加顺序无关。"""
+        rows = [
+            {"时间": "2026-01-01T10:00:00Z", "动作": "开卡", "任务": "CL-20260101-01",
+             "标题": "晚开", "项目": "p", "来源": "CL", "派活人": "x", "父任务": ""},
+            {"时间": "2026-01-01T09:00:00Z", "动作": "开卡", "任务": "CL-20260101-02",
+             "标题": "早开", "项目": "p", "来源": "CL", "派活人": "x", "父任务": ""},
+        ]
+        with open(self.book, "w", encoding="utf-8") as fh:
+            for e in rows:
+                fh.write(json.dumps(e, ensure_ascii=False) + "\n")
+        out = self.cli("列表").stdout
+        got = [ln.split("\t")[0] for ln in out.splitlines() if ln.startswith("CL-")]
+        self.assertEqual(got, ["CL-20260101-02", "CL-20260101-01"])
 
     def test_sequence_over_99_and_other_day(self):
         """不同日期不串号，序号超过两位时自然增长，不截断已有历史。"""

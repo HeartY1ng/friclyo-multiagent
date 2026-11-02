@@ -30,3 +30,6 @@ __pycache__/
 /bin/ledger-test-*/
 /bin/codex-worker-test-*/
 /.offline-tests-*/
+
+# 旧版验收证据目录
+verify-*

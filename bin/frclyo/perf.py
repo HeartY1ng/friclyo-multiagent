@@ -23,4 +23,4 @@ def append(record):
         row["费用美元"] = float(row["费用美元"])
     json.dumps(row, allow_nan=False)
     with LedgerLock(config.path_of("perf_file")) as lock:
-        lock.append([row])
+        lock.append([row], separate_tail=True)

@@ -5,16 +5,19 @@ import os
 from pathlib import Path
 import re
 import tempfile
+import warnings
 
 
 # 提供方集合显式配置时以用户列出的键为准；已有家只补齐缺失字段。
 DEFAULTS = {
-    "version": 1, "work_dir": "~/AgentWork", "board_port": 8789,
+    "version": 1, "board_port": 8789,
     "codex": {"proxy": "", "default_fast": True},
     "providers": {
         "deepseek": {"opencode_family": "deepseek", "api_host": "api.deepseek.com", "balance_api": "deepseek"},
         "moonshotai-cn": {"opencode_family": "moonshotai-cn", "api_host": "api.moonshot.cn", "balance_api": "moonshot"},
         "xiaomi": {"opencode_family": "xiaomi", "api_host": "api.xiaomimimo.com", "balance_api": ""},
+        "zai-coding-plan": {"opencode_family": "zai-coding-plan", "api_host": "api.z.ai", "balance_api": "zai-quota"},
+        "zhipuai": {"opencode_family": "zhipuai", "api_host": "open.bigmodel.cn", "balance_api": "zhipu-no-api"},
     },
 }
 
@@ -31,9 +34,33 @@ def codex_home():
     return Path(_path(os.environ.get("CODEX_HOME", "~/.codex"), "CODEX_HOME"))
 
 
+def root_dir():
+    """唯一根目录来自环境；规范别名，避免权限规则使用两种路径。"""
+    root = Path(_path(os.environ.get("FRCLYO_HOME", "~/AgentWork"), "FRCLYO_HOME")).resolve()
+    forbidden = (Path.home() / "Desktop", Path.home() / "Documents",
+                 Path.home() / "Library/Mobile Documents", Path.home() / "Library/CloudStorage")
+    if (root / ".git").exists() or any(root.is_relative_to(p.resolve()) for p in forbidden):
+        raise ValueError("根目录不能是 git 仓库，也不能位于桌面、文稿或云盘目录")
+    return root
+
+
+def config_file(for_write=False):
+    """测试覆盖优先；仅读取允许回退，写入永远采用新位置。"""
+    if "FRCLYO_CONFIG" in os.environ:
+        return Path(_path(os.environ["FRCLYO_CONFIG"], "FRCLYO_CONFIG"))
+    current = root_dir() / "配置/config.json"
+    legacy = Path.home() / ".frclyo/config.json"
+    return legacy if not for_write and not current.exists() and legacy.exists() else current
+
+
+def migration_needed():
+    """供 doctor 明确提醒，不自动搬运旧配置。"""
+    return config_file() != config_file(for_write=True)
+
+
 def load():
     """返回独立字典；每次读取，允许调用方修改返回值而不污染默认值。"""
-    path = _path(os.environ.get("FRCLYO_CONFIG", "~/.frclyo/config.json"), "FRCLYO_CONFIG")
+    path = config_file()
     try:
         with open(path, encoding="utf-8") as stream:
             given = json.load(stream)
@@ -45,7 +72,7 @@ def load():
     return _normalize(given)
 
 
-def _normalize(given):
+def _normalize(given, warn_legacy=True):
     """读写共用校验和缺省合并，写入前发现错误。"""
     if not isinstance(given, dict):
         raise ValueError("配置必须为 JSON 对象")
@@ -75,17 +102,36 @@ def _normalize(given):
         entry["api_host"] = host.lower()
         entry.setdefault("balance_api", "")
         cfg["providers"][provider] = entry
-    # 公共五条路径以及运行时内部路径都在此推导，执行脚本不自行解析配置。
-    cfg["work_dir"] = _path(cfg["work_dir"], "work_dir")
-    work = Path(cfg["work_dir"])
-    derived = {"deliver_dir": work / "交付", "cards_dir": work / "任务卡",
+    entries = cfg.get("keychain_entries", {})
+    if not isinstance(entries, dict):
+        raise ValueError("keychain_entries 必须为对象")
+    for provider, entry in entries.items():
+        if provider not in cfg["providers"] or not isinstance(entry, dict):
+            raise ValueError("keychain_entries 的家必须在 providers 中，条目必须为对象")
+        for field in ("service", "account"):
+            value = entry.get(field)
+            if (not isinstance(value, str) or not value.strip() or value.startswith("-")
+                    or any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in value)):
+                raise ValueError("keychain_entries." + field + " 必须为非空文字，不含控制字符且不以 - 开头")
+    # 数据路径只从根目录派生；忽略旧值且警告不回显内容，避免泄露误填凭据。
+    for name in ("work_dir", "cards_dir", "perf_file"):
+        if warn_legacy and name in given:
+            warnings.warn("旧配置字段 " + name + " 已忽略；数据统一位于 FRCLYO_HOME", UserWarning)
+    work = root_dir()
+    derived = {"work_dir": work, "config_dir": work / "配置",
+               "deliver_dir": work / "交付", "cards_dir": work / "任务卡",
                "ledger_file": work / "账本.jsonl", "perf_file": work / "表现记录.jsonl",
-               "runtime_dir": work / ".runtime" / "opencode",
-               "opencode_config": Path(__file__).resolve().parents[2] / "workers" / "opencode" / "opencode.worker.jsonc"}
-    for name, default in derived.items():
-        # 账本和交付位置固定在 work_dir 内，仅契约允许的字段可覆盖。
-        value = str(default) if name in ("deliver_dir", "ledger_file") else cfg.get(name, str(default))
-        cfg[name] = _path(value, name)
+               "availability_file": work / "模型可用性.json", "board_log_file": work / "运行时/看板.log",
+               "runtime_dir": work / "运行时/opencode", "control_dir": work / "运行时/控制/opencode", "assets_dir": work / "素材",
+               "projects_dir": work / "项目", "records_dir": work / "台账",
+               "backup_dir": work / "台账/备份", "archive_dir": work / "台账/归档",
+               "framework_dir": work / "框架", "development_dir": work / "框架-开发"}
+    # 旧目录若通过链接指向根外，也不能借派生路径绕过统一布局。
+    if any(not path.resolve().is_relative_to(work) for path in derived.values()):
+        raise ValueError("数据路径不能通过符号链接移到根目录外")
+    cfg.update({name: str(path) for name, path in derived.items()})
+    cfg["opencode_config"] = _path(cfg.get("opencode_config", str(
+        Path(__file__).resolve().parents[2] / "workers/opencode/opencode.worker.jsonc")), "opencode_config")
     for name in ("key_env_file", "models_snapshot_source"):
         if name in cfg:
             cfg[name] = _path(cfg[name], name)
@@ -93,8 +139,10 @@ def _normalize(given):
 
 
 def path_of(name):
-    """公共路径接口仅接受契约五个名字，不创建目录，保证只读调用无副作用。"""
-    if name not in ("work_dir", "deliver_dir", "cards_dir", "ledger_file", "perf_file"):
+    """公共路径接口只接受已知派生名字，不创建目录，保证只读调用无副作用。"""
+    if name not in ("work_dir", "config_dir", "deliver_dir", "cards_dir", "ledger_file", "perf_file",
+                    "availability_file", "board_log_file", "runtime_dir", "control_dir", "assets_dir", "projects_dir", "records_dir",
+                    "backup_dir", "archive_dir", "framework_dir", "development_dir"):
         raise ValueError("未知路径名称：" + name)
     return load()[name]
 
@@ -102,6 +150,11 @@ def path_of(name):
 def ensure_layout():
     """启动工人时创建数据目录；账本和表现文件留到有记录时再写。"""
     cfg = load()
+    # 根下数据目录不能用符号链接挪出根；检测失败不创建任何布局。
+    for name in ("deliver_dir", "cards_dir", "runtime_dir", "control_dir"):
+        path = Path(cfg[name])
+        if path != path.resolve():
+            raise ValueError("数据目录不能含符号链接：" + name)
     for name in ("work_dir", "deliver_dir", "cards_dir"):
         Path(cfg[name]).mkdir(parents=True, exist_ok=True)
     Path(cfg["perf_file"]).parent.mkdir(parents=True, exist_ok=True)
@@ -110,9 +163,16 @@ def ensure_layout():
 
 def _write(cfg, exclusive=False):
     """同目录临时文件落盘后原子发布；初始化用硬链接保证不覆盖并发创建。"""
-    _normalize(cfg)
+    # 保存公共读取结果时剔除派生路径，避免把旧字段重新写进配置。
+    if not isinstance(cfg, dict):
+        raise ValueError("配置必须为 JSON 对象")
+    cfg = {k: v for k, v in cfg.items() if k not in (
+        "work_dir", "config_dir", "deliver_dir", "cards_dir", "ledger_file", "perf_file",
+        "availability_file", "board_log_file", "runtime_dir", "control_dir", "assets_dir", "projects_dir", "records_dir",
+        "backup_dir", "archive_dir", "framework_dir", "development_dir")}
+    _normalize(cfg, warn_legacy=False)
     data = (json.dumps(cfg, ensure_ascii=False, indent=2, allow_nan=False) + "\n").encode("utf-8")
-    path = Path(_path(os.environ.get("FRCLYO_CONFIG", "~/.frclyo/config.json"), "FRCLYO_CONFIG"))
+    path = config_file(for_write=True)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, temporary = tempfile.mkstemp(prefix=".config-", dir=str(path.parent))
     try:
@@ -137,11 +197,11 @@ def save(cfg):
 
 def init_default(overrides):
     """仅首次生成默认配置；已有文件保持原字节，返回公共读取结果。"""
-    path = Path(_path(os.environ.get("FRCLYO_CONFIG", "~/.frclyo/config.json"), "FRCLYO_CONFIG"))
+    path = config_file(for_write=True)
     if path.exists():
         return load()
     # 先合并默认字段，再保存未展开的用户路径，便于配置随 HOME 移动。
-    _normalize(overrides)
+    _normalize(overrides, warn_legacy=False)
     value = copy.deepcopy(DEFAULTS)
     value.update(copy.deepcopy(overrides))
     value["codex"] = dict(DEFAULTS["codex"], **value["codex"])

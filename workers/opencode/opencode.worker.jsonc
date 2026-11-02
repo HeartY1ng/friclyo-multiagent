@@ -2,7 +2,7 @@
 //
 // 由 ../../bin/opencode-worker.sh 通过 OPENCODE_CONFIG 环境变量加载。
 // 权限模板保留现有防护；入口按公共配置限定本轮提供方和 API 主机。
-//   - 默认模板保留三家模型白名单：DeepSeek、Kimi（Moonshot 开放平台国内版）、小米 MiMo。
+//   - 默认模板保留五家模型白名单：DeepSeek、Kimi（Moonshot 开放平台国内版）、小米 MiMo、GLM（Z.AI Coding Plan）、GLM（智谱国内按量付费）。
 //     其余提供方（含 anthropic、openai、github-copilot、opencode 免费模型）一律不加载。
 //   - key 只用 {env:变量名} 引用，由执行脚本每次只注入一把，配置文件里不出现任何 key。
 //   - 权限里不能留任何 "ask"：无人值守的 run 模式会自动拒绝 ask，并让整轮直接停止。
@@ -10,8 +10,8 @@
 {
   "$schema": "https://opencode.ai/config.json",
 
-  // 只加载这三家
-  "enabled_providers": ["deepseek", "moonshotai-cn", "xiaomi"],
+  // 只加载这五家
+  "enabled_providers": ["deepseek", "moonshotai-cn", "xiaomi", "zai-coding-plan", "zhipuai"],
 
   // 不自动升级、不分享会话、不做快照、不下载语言服务器和格式化工具
   "autoupdate": false,
@@ -22,6 +22,18 @@
   "default_agent": "worker",
 
   "provider": {
+    // 智谱国内开放平台按量付费；候选模型尚待实测校准。
+    "zhipuai": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": { "baseURL": "https://open.bigmodel.cn/api/paas/v4", "apiKey": "{env:ZHIPU_API_KEY}" },
+      "whitelist": ["glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-5.1", "glm-5", "glm-4.5-air"]
+    },
+    // Z.AI 国际版编程套餐；候选模型尚待实测校准。
+    "zai-coding-plan": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": { "baseURL": "https://api.z.ai/api/coding/paas/v4", "apiKey": "{env:ZHIPU_API_KEY}" },
+      "whitelist": ["glm-5.3", "glm-5.3-flash", "glm-5.3-highspeed", "glm-5.2", "glm-5.2-highspeed", "glm-4.7", "glm-5-turbo"]
+    },
     // DeepSeek：v4-pro 质量高，flash 便宜快；nothink 变体用于关闭思考
     "deepseek": {
       "options": { "baseURL": "https://api.deepseek.com", "apiKey": "{env:DEEPSEEK_API_KEY}" },
